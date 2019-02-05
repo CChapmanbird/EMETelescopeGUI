@@ -1,0 +1,2097 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+#Original Code by Kingsley Baxter & Fiona Porter 2017 - See wiki for this version.
+
+#Copy of existing interface with my own personal changes / Christian Chapman-Bird 2018
+
+#--------------------------------------------------------------------------------------------------------------------
+
+#This script handles the interface for the Lunar Radio Telescope (LRT). Ensure use with Python3 (and by extension,
+# Spyder 3.x). 
+#   The interface always has room for improvement, but currently consists of a navigation interface allowing for
+#tracked observation of either a chosen object or a set of coordinates. Such an observation may be planned ahead 
+#of time with the observing scheduler feature - for a chosen number of hours (min. 1), telescope time may be 
+#scheduled in advance, and the handler will automatically perform the slew and track for as long as desired. The 
+#program MUST be left running for this to occur - leaving all windows open is highly recommended. 
+#   If any issues should arise, first try restarting the computer and ensuring no connections are loose on the drive
+#or PC. If problems persist, contact Christian Chapman-Bird at 2191474C@student.gla.ac.uk. Happy observing!
+
+#   (all code is labelled with its respective author in the form /INITIALS)
+
+#--------------------------------------------------------------------------------------------------------------------
+
+import tkinter as tk
+import tkinter.ttk as ttk
+import time
+import math
+import ephem
+import datetime
+import serial
+
+#The scheduleing feature of this interface uses the PyTables module. Therefore, it is important that the
+#file 'Schedule_Base' is present in the home directory for data access and writing, or there will be trouble. /ccb
+import tables
+
+def runinterface():
+    #Initialise the interface.
+    menuscreen=tk.Tk()
+    
+    # Setting up styles /fp
+    style = ttk.Style()
+    style.configure("Upper.TFrame", background="gray20")
+    style.configure("Lower.TFrame", background="white")
+    style.configure("Upper.TLabel", foreground="white", background="gray20", width=15, anchor=tk.CENTER)
+    style.configure("Lower.TLabel", foreground="black", background="white", width=15, anchor=tk.CENTER)
+    style.configure("WiderUpper.TLabel", foreground="white", background="gray20", width=18, anchor=tk.CENTER)
+    style.configure("WiderLower.TLabel", foreground="black", background="white", width=18, anchor=tk.CENTER)
+    style.configure("MiniUpper.TLabel", foreground="white", background="gray20", width=2, anchor=tk.W)
+    style.configure("MiniLower.TLabel", foreground="black", background="white", width=2, anchor=tk.W)
+    style.configure("ErrorLower.TLabel", foreground="black", background="white")
+    style.configure("Lower.TCheckbutton", background="white")
+    
+    class ScheduleParams(tables.IsDescription):
+        #PyTables class. Important as without this no data can be saved. /ccb
+        startinghour = tables.IntCol()
+        finishinghour = tables.IntCol()
+        h_object = tables.StringCol(100)
+        author = tables.StringCol(100)
+        note = tables.StringCol(250)
+        track = tables.BoolCol()
+        chop = tables.BoolCol()
+    
+    #Pop out the menu and set it up appropriately, in the centre of the screen /ccb
+    menuscreen.lift()
+    menuscreen.title("Telescope Interface")
+    menuscreen.resizable(0, 0)
+    menuscreen.columnconfigure(0,minsize=75)
+    menuscreen.columnconfigure(1,minsize=75)
+    menuw = 266
+    menuh = 70
+    menuscreenframe = ttk.Frame(menuscreen, width=menuw, height=menuh, style="Lower.TFrame")
+    menuscreenframe.tkraise()
+    scrwidth = menuscreen.winfo_screenwidth()
+    scrheight = menuscreen.winfo_screenheight()
+    centrex = scrwidth/2 - menuw/2
+    centrey = scrheight/2 - menuh/2
+    menuscreen.geometry('%dx%d+%d+%d'% (menuw,menuh,centrex,centrey))
+    
+    #Buttons for the title menu - r-con interface could be implemented here /ccb
+    navbutton = tk.Button(menuscreen, text="Navigation Interface", width=15, height=5, wraplength=70,
+                               background="light sky blue", activebackground="deep sky blue",
+                               command=lambda: navigation_menu())
+    navbutton.grid(row=0,column=0)
+    
+    radiobutton = tk.Button(menuscreen, text="Radio Control Interface", width=15, height=5, wraplength=70,
+                            background="light sky blue", activebackground="deep sky blue",
+                            command=lambda: print("Not yet implemented"))
+    radiobutton.grid(row=0,column=1)
+    def navigation_menu():
+        def rerunandquit():
+            # This function allows the program to rerun from the start, destroying all active tkinter windows
+            # Used for errors where the driver isn't connected - /fp
+            nodriverwindow.destroy()
+            mainnavinterface.destroy()
+            navigation_menu()
+            
+        # Predefining a bunch of variables that are used later on to prevent error and speed up allocation
+        dataAZ = [0, 0, 0, 0]
+        dataEL = [0, 0, 0, 0]
+        NULL = chr(0)
+        today = datetime.date.today()
+        day = today.day
+        month = today.month
+        year = today.year
+        
+        
+        def editsch():
+            #Remove a newly-defunct schedule row from the table after observing is complete. /ccb
+            schedulefile = tables.open_file("Schedule_Base", mode = "a")
+            htable = getattr(schedulefile.root.schedules,'schedule_{}_{}_{}'.format(day,month,year))
+            htable.remove_rows(0,1)
+            htable.flush()
+            schedulefile.close()
+            
+        def refreshsch():
+            #Import schedule data from file and pass to Tkinter for use elsewhere.
+            #This is done once per hour to ensure any updates made will be downloaded before their alloted time. /ccb
+            currentschedule=[]
+            schedulefile = tables.open_file("Schedule_Base", mode = "a")
+            schedulegroup = schedulefile.root.schedules
+            if schedulefile.__contains__('/schedules/schedule_{}_{}_{}'.format(day,month,year)) == False:
+                htable = schedulefile.create_table(schedulegroup,'schedule_{}_{}_{}'.format(day,month,year),
+                                                   ScheduleParams,'{}-{}-{}_Schedule'.format(day,month,year))
+            else:
+                htable = getattr(schedulegroup,'schedule_{}_{}_{}'.format(day,month,year))
+            startinghours = [x['startinghour'] for x in htable.iterrows()]
+            finishinghours = [x['finishinghour'] for x in htable.iterrows()]
+            objects = [x['h_object'] for x in htable.iterrows()]
+            authors = [x['author'] for x in htable.iterrows()]
+            notes = [x['note'] for x in htable.iterrows()]
+            tracks = [x['track'] for x in htable.iterrows()]
+            chops = [x['chop'] for x in htable.iterrows()]
+            if startinghours != []:
+                for x in range(0,len(startinghours)):
+                    currentschedule.append((int(startinghours[x]),int(finishinghours[x]),str(objects[x].decode('utf-8')),
+                                   str(authors[x].decode('utf-8')), str(notes[x].decode('utf-8')), bool(tracks[0]),bool(chops[0])))
+                sorted(currentschedule, key=lambda sched: sched[0])
+            mainnavinterface.schedule = currentschedule
+            mainnavinterface.after(60*60*1000,refreshsch)
+                
+        def followsch():
+            #Follows the schedule at the requested time. Will wrap up the observing afterwards by stowing
+            #the telescope. /ccb
+            scheduletofollow = mainnavinterface.schedule
+            try:
+                schline = scheduletofollow[0]
+            except:
+                
+                mainnavinterface.after(3600*1000,followsch)
+                
+                return
+            if schline[0] == int(time.strftime("%H",time.gmtime())):
+                hourstoobserve = schline[1] - schline[0]
+                objchoice.set(schline[2])
+                if schline[6] == True:
+                    mainnavinterface.chopchoice.set(True)
+                elif schline[6] == False and schline[5] == True:
+                    objtrackchoice.set(True)
+                followingsch = True
+                print('Tracking should have started.')
+                statusupdate(objchoice,followingsch,hourstoobserve,is_obj=True)
+                mainnavinterface.after(hourstoobserve*3600*1000,lambda:[editsch,followsch,Stop_Drive])
+            else:
+                gostow()
+                mainnavinterface.after(3600*1000,followsch)
+        
+        mainnavinterface = tk.Toplevel()     
+        #Settings config - done with a basic text setup, not ideal but satisfactory for this minor task /ccb
+        settingsfile = open("settingsfile.txt","r")
+        all_lines = settingsfile.readlines()
+        defaulthomeaz = all_lines[0].rstrip()
+        defaulthomeel = all_lines[1].rstrip()
+        defaultstowaz = all_lines[2].rstrip()
+        defaultstowel = all_lines[3].rstrip()
+        mainnavinterface.chopdist = int(all_lines[4].rstrip())
+        mainnavinterface.chopperiod = int(all_lines[5].rstrip())
+        mainnavinterface.chopgrace = int(all_lines[6].rstrip())
+        settingsfile.close()
+        
+        # Setting up all the Tkinter Variables, these act as global variables but I think they're a bit safer, 
+        #also python is terrible at functions /kb
+ 
+        Az = tk.StringVar(mainnavinterface)
+        Az.set("0.0")
+        El = tk.StringVar(mainnavinterface)
+        El.set("0.0")
+        TarAZ = tk.StringVar(mainnavinterface)
+        TarAZ.set("0.0")
+        TarEL = tk.StringVar(mainnavinterface)
+        TarEL.set("0.0")
+        Already = tk.BooleanVar(mainnavinterface)
+        Already.set(True)
+        
+        #Changed port to allow use with a Linux OS. /ccb
+        settingsfile = open("settingsfile.txt","r")
+        Server = serial.Serial()
+        Server.port = '/dev/ttyUSB0'
+        Server.baudrate = 460800
+        try:
+            Server.open()
+        except serial.serialutil.SerialException:
+            # Popup error if the driver isn't plugged in /fp
+            nodriverwindow = tk.Toplevel()
+            nodriverwindow.title("Error: No Driver")
+            nodriverwindow.lift()
+            nodriverframe = tk.Frame(nodriverwindow, background="white")
+            nodriverframe.columnconfigure(0, minsize=150)
+            nodriverframe.columnconfigure(1, minsize=150)
+            nodriverframe.rowconfigure(0, minsize=50)
+            nodriverframe.rowconfigure(1, minsize=50)
+            warning = tk.Label(nodriverframe, text="Error: driver not detected.\nPlease ensure the driver is connected to the "
+                                                   "computer and turned on.", justify=tk.CENTER, background="white",
+                               wraplength=150)
+            okbutton = tk.Button(nodriverframe, text="Retry", width=12, height=1, wraplength=70,
+                                 background="light sky blue", activebackground="deep sky blue",
+                                 command=lambda: rerunandquit())
+            exitbutton = tk.Button(nodriverframe, text="Quit", width=12, height=1, wraplength=70,
+                                   background="light sky blue", activebackground="deep sky blue", 
+                                   command=lambda: nodriverwindow.destroy())
+            nodriverframe.grid(row=0, column=0, columnspan=2, rowspan=2)
+            warning.grid(row=0, column=0, columnspan=2)
+            okbutton.grid(row=1, column=0)
+            exitbutton.grid(row=1, column=1)
+            mainnavinterface.withdraw()
+            nodriverwindow.mainloop()
+    
+    
+        # The Rot2Prog protocol has three commands: Goto, Status, and Stop. Status and Stop don't require coordinate input
+        # So they can be defined now to improve efficiency in the program. See above for an explanation of the protocol. /kb
+        Stop_String = "W" + NULL * 10 + chr(15) + chr(32)
+        Stop_Command = Stop_String.encode('utf-8')
+        Read_String = "W" + NULL * 10 + chr(31) + chr(32)
+        Read_Command = Read_String.encode('utf-8')
+        
+        #Defining some properties here for later use. /ccb
+        mainnavinterface.coord_statusupdate=""
+        mainnavinterface.errorflag=False
+        mainnavinterface.afterid=""
+        mainnavinterface.chopvar = False
+        mainnavinterface.chopflag = False
+        
+        # The Stop function is the first one to be defined so that it can be inserted into future functions. /kb
+        def Stop_Drive():
+            #Stops the Drive
+            Server.write(Stop_Command)
+            #Cancel tracking when the drive is stopped /ccb
+            try:
+                mainnavinterface.after_cancel(mainnavinterface.afterid)
+            except ValueError:
+                pass
+            mainnavinterface.coord_statusupdate=""
+            mainnavinterface.chopvar = False
+            mainnavinterface.chopflag = False
+            
+        # The read function, it sends the command and then reads the response. See above for a detailed breakdown of the
+        # response. Due to wanting the Drive to always move in a certain direction another function BetaSet_Drive() is called. /kb
+        def ReadFunction():
+            #Reads the current position of the drive and passes it back into tkinter.
+            Server.write(Read_Command)
+            Data = Server.read(11).decode('utf-8')
+            
+            Bin = Server.read() #This seemingly unimportant variable is of paramount importance in drive operation.
+                                #It clears the server output to read in the next az-el readout.
+            del Bin
+            
+            DataAZ = Data[1:5]  # The Azimuth is the 2nd through 5th character sent in the response
+            DataEL = Data[6:10]  # The Elevation is the 6th through 10th character sent in the response
+            for e in range(0, 4):
+                dataAZ[e] = ord(DataAZ[e])  # converts the ascii character into a number since it uses ascii index 0-10 the
+                # number doesn't need to be manipulated further.
+                dataEL[e] = ord(DataEL[e])
+            Azimuth = ((dataAZ[0] * 1000 + dataAZ[1] * 100 + dataAZ[2] * 10 + dataAZ[3]) / 10) - 360
+            Elevation = ((dataEL[0] * 1000 + dataEL[1] * 100 + dataEL[2] * 10 + dataEL[3]) / 10) - 360
+            Azimuth = "{0:.1f}".format(Azimuth)
+            Elevation = "{0:.1f}".format(Elevation)
+            Az.set(Azimuth)
+            El.set(Elevation)
+            if Already.get() == False:
+                BetaSet_Drive()
+    
+            mainnavinterface.after(50, ReadFunction)  # Returns the two numbers so they can be displayed.
+    
+    
+        # Important function. Can't predefine the command since it changes with the coordinates. Will set an Azimuth and
+        # Elevation for the Drive to point at. /kb
+        def BetaSet_Drive():
+            # "This function is used when the Drive needs to move more than 180 degrees to make sure the drive goes the long
+            # way round."
+            Target = float(TarAZ.get())
+            Current = float(Az.get())
+            Comparison = Target - Current
+            if abs(Comparison) > 180:
+                return
+    
+            AZ = Target
+            AZ = AZ + 360
+            AZ = str(AZ)  # Its easier to split up a string then a number, at least to my knowledge.
+            if len(AZ) < 5:
+                AZ = (5 - len(AZ)) * "0" + AZ
+            AZhundreds = AZ[0]  # Seperates the Digits out so that they can be read into their own byte.
+            AZtens = AZ[1]
+            AZdigits = AZ[2]
+            AZtenths = AZ[4]
+    
+            EL = float(TarEL.get()) + 360
+            EL = str(EL)  # Its easier to split up a string then a number, at least to my knowledge.
+            if len(EL) < 5:
+                EL = (5 - len(EL)) * "0" + AZ
+            ELhundreds = AZ[0]  # Seperates the Digits out so that they can be read into their own byte.
+            ELtens = AZ[1]
+            ELdigits = AZ[2]
+            ELtenths = AZ[4]
+    
+            ACC = chr(10)  # The Accuracy of this driver is 0.1 Degrees Therefore to change the numbers from integers to floats
+            # a quotient of 10 is required.
+            COMMAND = chr(47)  # Command 47 is the Set command, there are two others Read (31) and Stop (15).
+            END = chr(32)  # The End of the transmission is marked by a space bar or ascii character 32.
+    
+            Set_String = "W" + AZhundreds + AZtens + AZdigits + AZtenths + ACC + ELhundreds + ELtens + ELdigits + ELtenths + \
+                         ACC + COMMAND + END  # The culmination of the processes above are fed into this string.
+            Set_Command = Set_String.encode('utf-8')  # Which is then encoded into byte information to be sent.
+            Server.write(Stop_Command)
+            time.sleep(0.1)
+            Server.write(Set_Command)
+            Already.set(True)
+    
+    
+        # Most important function will take in an Az El and make the drive turn to that location. Its pretty robust with the
+        # error messages above. Needs BetaSet_Drive to function due to the BREAK part of the code. Important thing about this
+        # code is that the Tkinter variables are the key. They are used as checks and balances. Make sure they are all there or
+        # that all reference to them is gone otherwise problems will occur. /kb
+        def Set_Drive(AZInput, ELInput):
+            "Drives the Drive to a set Azimuth and Elevation"
+            BREAK = float(Az.get()) + 179
+            BREAK2 = float(Az.get()) - 179
+            try:
+                AZ = float(AZInput)  # Converts the string to a Float for numerical manipulation
+                EL = float(ELInput)
+            except ValueError:
+                return
+    
+            if (EL < -0) or (EL > 90):
+                return
+    
+            if (AZ < 0) or (AZ > 360):
+                return
+            TarAZ.set(str(AZ))
+            TarEL.set(str(EL))
+    
+            if AZ > BREAK:
+                AZ = BREAK
+                Already.set(False)
+            elif AZ < BREAK2:
+                AZ = BREAK2
+                Already.set(False)
+                # The controller can't take negative number so all number are increased by 360 degrees
+    
+            EL = EL + 360
+            AZ = AZ + 360
+            AZ = str(AZ)  # Its easier to split up a string then a number, at least to my knowledge.
+            if len(AZ) < 5:
+                AZ = (5 - len(AZ)) * "0" + AZ
+            EL = str(EL)
+            if len(EL) < 5:
+                EL = (5 - len(EL)) * "0" + AZ
+    
+            AZhundreds = AZ[0]  # Seperates the Digits out so that they can be read into their own byte.
+            AZtens = AZ[1]
+            AZdigits = AZ[2]
+            AZtenths = AZ[4]
+    
+            ELhundreds = EL[0]  # Same for Elevation as Azimuth
+            ELtens = EL[1]
+            ELdigits = EL[2]
+            ELtenths = EL[4]
+    
+            ACC = chr(10)  # The Accuracy of this driver is 0.1 Degrees Therefore to change the numbers from integers to floats
+            # a quotient of 10 is required.
+            COMMAND = chr(47)  # Command 47 is the Set command, there are two others Read (31) and Stop (15).
+            END = chr(32)  # The End of the transmission is marked by a space bar or ascii character 32.
+    
+            Set_String = "W" + AZhundreds + AZtens + AZdigits + AZtenths + ACC + ELhundreds + ELtens + ELdigits + ELtenths + \
+                         ACC + COMMAND + END  # The culmination of the processes above are fed into this string.
+            Set_Command = Set_String.encode('utf-8')  # Which is then encoded into byte information to be sent.
+    
+            Server.write(Set_Command)
+    
+        # Establish the telescope's location for ephem
+        # Coordinates here are those for the telescope site as given by Google Maps /fp
+        mylocation = ephem.Observer()
+        mylocation.long, mylocation.lat = '-4.307077', '55.902429'
+ 
+        def todms(inputangle):
+            # Converter between angles in fractional degrees and dms; produces output string for the interface coordinates /fp
+            
+            # Separate out degrees, minutes and seconds, initially as ints or floats
+            degree = math.floor(inputangle)
+            firstremainder = inputangle-degree
+            minute = math.floor(firstremainder*60)
+            secondremainder = (firstremainder*60)-minute
+            second = round(secondremainder*60, 1)
+    
+            # The rounding sometimes causes the seconds value to appear as 60; this corrects it
+            if second == 60:
+                second = 0
+                minute = minute + 1
+            degformat = "{0:0=3d}°".format(degree)
+            minformat = "{0:0=2d}m".format(minute)
+            secformat = "{0:04.1f}s".format(second)
+            coord = "{} {} {}".format(degformat, minformat, secformat)
+            return coord
+    
+    
+        # Clock in UTC; updates every 500ms
+        # Note: this isn't the clock used in ephem calculations, so it's not intended to be especially precise /fp
+        def tick():
+            timenow = time.strftime("%H:%M:%S", time.gmtime())
+            clock.config(text=timenow)
+            clock.after(500, tick)
+    
+    
+        def getlocation():
+            # Get current az-el from driver
+            # Convert to ra-dec
+            # Produce four labels for az-el and ra-dec coordinates
+            # Update this periodically - 50ms /fp
+            
+            aznow = float(Az.get())  # placeholder
+            elnow = float(El.get())  # placeholder
+            mylocation.date = datetime.datetime.utcnow()
+            [rarad, decrad] = mylocation.radec_of(math.radians(aznow), math.radians(elnow))
+            
+            ranow = math.degrees(rarad)
+            decnow = math.degrees(decrad)
+            azcoord = todms(aznow)
+            elcoord = todms(elnow)
+            racoord = todms(ranow)
+            deccoord = todms(decnow)
+            azval.config(text=azcoord)
+            elval.config(text=elcoord)
+            raval.config(text=racoord)
+            decval.config(text=deccoord)
+            decval.after(50, getlocation)
+    
+        def gohome():
+            # Home the telescope. /ccb
+            homeazfloat = float(homeaz.get())
+            homeelfloat = float(homeel.get())
+            Set_Drive(homeazfloat, homeelfloat)
+    
+        def gostow():
+            # Stow the telescope. /ccb
+            stowazfloat = float(stowaz.get())
+            stowelfloat = float(stowel.get())
+            Set_Drive(stowazfloat, stowelfloat)
+    
+        def mainquit():
+            # Quit function: Now properly closes the port when exiting the interface. /ccb
+            mainnavinterface.destroy()
+            Server.close()
+    
+        def stowandquit():
+            # Special case of the stow command that also quits the interface. /ccb
+            stowazfloat = float(stowaz.get())
+            stowelfloat = float(stowel.get())
+            Set_Drive(stowazfloat, stowelfloat)
+            mainquit()
+    
+        def stowcheck():
+            # Offers a prompt to drive the telescope to the stow position before shutting the interface /fp
+            checkAz = float(Az.get())
+            checkEl = float(El.get())
+            if checkAz == float(stowaz.get()) and checkEl == float(stowel.get()):
+                mainquit()
+                return
+            stowwindow = tk.Toplevel()
+            stowwindow.title("Stow?")
+            stowframe = ttk.Frame(stowwindow, style="Lower.TFrame")
+            
+            stoww=300
+            stowh=100
+            stowx=int(scrwidth/2-stoww/2)
+            stowy=int(scrheight/2-stowh/2)
+            stowwindow.geometry('{}x{}+{}+{}'.format(stoww, stowh, stowx, stowy))
+            
+            stowframe.columnconfigure(0, minsize=150)
+            stowframe.columnconfigure(1, minsize=150)
+            stowframe.rowconfigure(0, minsize=50)
+            stowframe.rowconfigure(1, minsize=50)
+            warning = ttk.Label(stowframe, text="Stow the telescope before quitting?", justify=tk.CENTER,
+                                style="ErrorLower.TLabel", wraplength=150)
+            okbutton = tk.Button(stowframe, text="Yes", width=12, height=1, wraplength=70,
+                                 background="light sky blue", activebackground="deep sky blue", 
+                                 command=lambda:[stowandquit(),stowwindow.destroy()])
+            exitbutton = tk.Button(stowframe, text="No", width=12, height=1, wraplength=70,
+                                   background="light sky blue", activebackground="deep sky blue", 
+                                   command=lambda:[mainquit(),stowwindow.destroy()])
+            stowframe.grid(row=0, column=0, columnspan=2, rowspan=2)
+            warning.grid(row=0, column=0, columnspan=2)
+            okbutton.grid(row=1, column=0)
+            exitbutton.grid(row=1, column=1)
+            stowwindow.mainloop()
+                
+    
+        def missinginputerror(problemphrase):
+            # This error message appears when information is missing
+            # The "problemphrase" input allows for a custom message to be displayed for each different error /fp
+            mainnavinterface.errorflag=True
+            errorwindow = tk.Toplevel()
+            errorwindow.title("Error")
+            errorwindow.lift()
+            errorframe = ttk.Frame(errorwindow, style="Lower.TFrame")
+            errorframe.columnconfigure(0, minsize=200)
+            errorframe.rowconfigure(0, minsize=50)
+            errorframe.rowconfigure(1, minsize=50)
+            warning = ttk.Label(errorframe, text="Error: missing input.\nPlease select " + problemphrase, justify=tk.CENTER,
+                                style="ErrorLower.TLabel", wraplength=150)
+            okbutton = tk.Button(errorframe, text="OK", width=12, height=1, wraplength=70,
+                                 background="light sky blue", activebackground="deep sky blue", command=errorwindow.destroy)
+            errorframe.grid(row=0, column=0)
+            warning.grid(row=0, column=0)
+            okbutton.grid(row=1, column=0)
+    
+        def invalidinputerror(problemphrase):
+            # This error message appears when input isn't valid - for example, text in a field that expects numbers
+            # The "problemphrase" input allows for a custom message to be displayed for each different error /fp
+            mainnavinterface.errorflag=True
+            errorwindow = tk.Toplevel()
+            errorwindow.title("Error")
+            errorwindow.lift()
+            errorframe = ttk.Frame(errorwindow, style="Lower.TFrame")
+            errorframe.columnconfigure(0, minsize=200)
+            errorframe.rowconfigure(0, minsize=50)
+            errorframe.rowconfigure(1, minsize=50)
+            warning = ttk.Label(errorframe, text="Error: invalid input.\nPlease input " + problemphrase, justify=tk.CENTER,
+                                style="ErrorLower.TLabel", wraplength=150)
+            okbutton = tk.Button(errorframe, text="OK", width=12, height=1, wraplength=70,
+                                 background="light sky blue", activebackground="deep sky blue", command=errorwindow.destroy)
+            errorframe.grid(row=0, column=0)
+            warning.grid(row=0, column=0)
+            okbutton.grid(row=1, column=0)
+    
+        def coordunavailableerror():
+            # This accounts for coordinates being below the horizon and prevents attempts to drive there. /fp
+            mainnavinterface.errorflag = True
+            errorwindow = tk.Toplevel()
+            errorwindow.title("Error")
+            errorwindow.lift()
+            errorframe = ttk.Frame(errorwindow, style="Lower.TFrame")
+            errorframe.columnconfigure(0, minsize=200)
+            errorframe.rowconfigure(0, minsize=50)
+            errorframe.rowconfigure(1, minsize=50)
+            warning = ttk.Label(errorframe, text="Error: coordinates unavailable.\nThis point is currently below the "
+                                                 "horizon.", justify=tk.CENTER, style="ErrorLower.TLabel", wraplength=150)
+            okbutton = tk.Button(errorframe, text="OK", width=12, height=1, wraplength=70,
+                                 background="light sky blue", activebackground="deep sky blue", command=errorwindow.destroy)
+            errorframe.grid(row=0, column=0)
+            warning.grid(row=0, column=0)
+            okbutton.grid(row=1, column=0)
+    
+        def schedule_startup():
+            #Schedule handler. /ccb
+            def saveobsslot(day,month,year,starthr,endhr,chosen_obj,author,note,track,chop):
+                #Saves a chosen observation slot in the schedule.
+                #Error Handling.
+                try:
+                    int(starthr)
+                    pass
+                except:
+                    invalidinputerror("a valid starting time.")
+                    return
+                try:
+                    int(endhr)
+                    pass
+                except:
+                    invalidinputerror("a valid finish time.")
+                    return
+                if int(starthr) > int(endhr):
+                    invalidinputerror("a forward-running time period.")
+                    return
+                if int(starthr) < 0 or int(starthr) > 23:
+                    invalidinputerror("a valid starting time")
+                    return
+                if int(endhr) < 0 or int(endhr) > 23:
+                    invalidinputerror("a valid finishing time")
+                    return
+                if chosen_obj == "":
+                    invalidinputerror("an object.")
+                    return
+                if author == "":
+                    invalidinputerror("an author.")
+                    return
+                if note == "":
+                    invalidinputerror("a descriptive note.")
+                    return
+                #Open up the PyTables file and input the given schedule details.
+                schedulefile = tables.open_file("Schedule_Base", mode = "a")
+                
+                #Schedule group in case of file loss.
+                #schedulegroup = schedulefile.create_group("/",'schedules','Schedule Info')
+                
+                schedulegroup = schedulefile.root.schedules
+                if schedulefile.__contains__('/schedules/schedule_{}_{}_{}'.format(day,month,year)) == False:
+                    htable = schedulefile.create_table(schedulegroup,'schedule_{}_{}_{}'.format(day,month,year),
+                                                       ScheduleParams,'{}-{}-{}_Schedule'.format(day,month,year))
+                else:
+                    htable = getattr(schedulegroup,'schedule_{}_{}_{}'.format(day,month,year))
+                rowpoint = htable.row
+                rowpoint['startinghour'] = int(starthr)
+                rowpoint['finishinghour'] = int(endhr)
+                rowpoint['h_object'] = chosen_obj
+                rowpoint['author'] = author
+                rowpoint['note'] = note
+                rowpoint['track'] = track
+                rowpoint['chop'] = chop
+                #Save the changes, flush the table and close up.
+                rowpoint.append()
+                htable.flush()
+                schedulefile.close()
+                #Rerun the date checker to update the interface.
+                enterdate(day,month,year)
+                
+            def enterdate(day,month,year):
+                #Changes the interface to another day, and updates the schedule to match.
+                def redden(numtoredden):
+                    #Turn numbers red.
+                    buttontochange = schwin.nametowidget("schframe.hour_{}".format(numtoredden))
+                    buttontochange.config(background='red')
+                
+                def greenen(numtogreenen):
+                    #Turn numbers green.
+                    buttontochange = schwin.nametowidget("schframe.hour_{}".format(numtogreenen))
+                    buttontochange.config(background='green')
+                
+                #Open the schedule file.
+                schedulefile = tables.open_file("Schedule_Base", mode = "a")
+                
+                #Try to open the table file. If it doesn't exist, no schedule has been made so it must be blank.
+                try:
+                    htable = getattr(schedulefile.root.schedules,'schedule_{}_{}_{}'.format(day,month,year))
+                    startinghours = [x['startinghour'] for x in htable.iterrows()]
+                    
+                    finishinghours = [x['finishinghour'] for x in htable.iterrows()]                
+                    for x in range(0,24):
+                        greenen(x)
+                        for y in range(0,len(startinghours)):
+                            for x in range(startinghours[y],finishinghours[y]+1):
+                                redden(x)
+                    schedulefile.close()
+                except:
+                    for x in range(0,24):
+                        greenen(x)
+                
+                
+            def displayschinfo(event,pressedno):
+                #Shows the info of the schedule, and allows removal of the scheduled obs.
+                
+                #Open and centre the screen.
+                schinfowin = tk.Toplevel()
+                schinfowin.title("Schedule Info")
+                schinfowin.resizable(0,0)
+                schw = 400
+                schh = 200
+            
+                schx = scrwidth/2 - schw/2 
+                schy = scrheight/2 - schh/2 -200
+                schinfowin.geometry('%dx%d+%d+%d'% (schw,schh,schx,schy))
+                
+                [day,month,year] = dy_ent.get(),mo_ent.get(),yr_ent.get()
+                state = []
+            
+                def greenen(numtogreenen):
+                    #Turn numbers green.
+                    buttontochange = schwin.nametowidget("schframe.hour_{}".format(numtogreenen))
+                    buttontochange.config(background='green')
+                    
+                def yellowen(numtoyellowen):
+                    #Turn numbers yellow.
+                    buttontochange = schwin.nametowidget("schframe.hour_{}".format(numtoyellowen))
+                    buttontochange.config(background='yellow')
+                
+                def redden(numtoredden):
+                    #Turn numbers red.
+                    buttontochange = schwin.nametowidget("schframe.hour_{}".format(numtoredden))
+                    buttontochange.config(background='red')
+            
+                def removeselectedobs(day,month,year,schedulefile,pressedno):
+                    #Remove the selected observation booking.
+                    try:
+                        htable = getattr(schedulefile.root.schedules,'schedule_{}_{}_{}'.format(day,month,year))
+                        starthrscheck = [x['startinghour'] for x in htable.iterrows()]
+                        finhrscheck = [x['finishinghour'] for x in htable.iterrows()]
+                        
+                        for x in range(0,len(starthrscheck)):
+                            if starthrscheck[x] <= pressedno and finhrscheck[x] >= pressedno:
+                                indextoremove = x
+                                selectedstart = starthrscheck[x]
+                                selectedfin = finhrscheck[x]
+                        htable.remove_rows(indextoremove,indextoremove+1)
+                        htable.flush()
+                        for x in range(selectedstart,selectedfin+1):
+                            greenen(x)
+                        schedulefile.close()
+                        schinfowin.destroy()
+                    except:
+                        print('no chance, mate')
+            
+                #Open the PyTables file, and grab the schedule info from it.        
+                schedulefile = tables.open_file("Schedule_Base", mode = "a")
+                try:
+                    htable = getattr(schedulefile.root.schedules,'schedule_{}_{}_{}'.format(day,month,year))
+            
+                    startinghours = [x['startinghour'] for x in htable.iterrows() 
+                                    if x['startinghour'] <= pressedno and x['finishinghour'] >= pressedno]
+                    finishinghours = [x['finishinghour'] for x in htable.iterrows() 
+                                    if x['startinghour'] <= pressedno and x['finishinghour'] >= pressedno]
+                    objects = [x['h_object'] for x in htable.iterrows() 
+                              if x['startinghour'] <= pressedno and x['finishinghour'] >= pressedno]
+                    authors = [x['author'] for x in htable.iterrows() 
+                              if x['startinghour'] <= pressedno and x['finishinghour'] >= pressedno]
+                    notes = [x['note'] for x in htable.iterrows() 
+                            if x['startinghour'] <= pressedno and x['finishinghour'] >= pressedno]
+                    tracks = [x['track'] for x in htable.iterrows()
+                             if x['startinghour'] <= pressedno and x['finishinghour'] >= pressedno]
+                    chops = [x['chop'] for x in htable.iterrows()
+                            if x['startinghour'] <= pressedno and x['finishinghour'] >= pressedno]
+                    #If all is ok, display the schedule information accordingly.
+                    for x in range(int(startinghours[0]),int(finishinghours[0])+1):
+                        yellowen(x)
+                    
+                    if startinghours == []:
+                        state = ['Unbooked']
+                        [startinghours,finishinghours,objects,notes,authors,tracks,chops] = [[''],[''],[''],[''],[''],[''],['']]
+                    else:
+                        state = ['Booked']
+                except:
+                    #If nothing is found, there cannot be a booking here.
+                    state=['Unbooked']
+                    startinghours = ['']
+                    finishinghours = ['']
+                    objects = ['']
+                    authors = ['']
+                    notes = ['']
+                    tracks = ['']
+                    chops = ['']
+                #Widgets. Messy but there's no getting around it.
+                schinfo_statelb = tk.Label(schinfowin,text=state[0])
+                schinfo_statelb.pack(fill=tk.BOTH)
+                schinfo_strthrlb = tk.Label(schinfowin,text="Starting Hour: "+str(startinghours[0]),width=30)
+                schinfo_strthrlb.pack(fill=tk.BOTH)
+                schinfo_finhrlb = tk.Label(schinfowin,text="Finishing Hour: "+str(finishinghours[0]),width=30)
+                schinfo_finhrlb.pack(fill=tk.BOTH)
+                try:
+                    schinfo_objlb = tk.Label(schinfowin,text="Object: "+str(objects[0].decode('utf-8')),width=30)
+                except AttributeError:
+                    schinfo_objlb = tk.Label(schinfowin,text="Object: "+str(objects[0]),width=30)   
+                schinfo_objlb.pack(fill=tk.BOTH)
+                try:
+                    schinfo_authlb = tk.Label(schinfowin,text="Author: "+str(authors[0].decode('utf-8')),width=30)
+                except AttributeError:
+                    schinfo_authlb = tk.Label(schinfowin,text="Author: "+str(authors[0]),width=30)
+                schinfo_authlb.pack(fill=tk.BOTH)
+                try:
+                    schinfo_notelb = tk.Label(schinfowin,text="Schedule Note: "+str(notes[0].decode('utf-8')),width=30)
+                except:
+                    schinfo_notelb = tk.Label(schinfowin,text="Schedule Note: "+str(notes[0]),width=30)
+                schinfo_notelb.pack(fill=tk.BOTH)
+                schinfo_slewtypelb = tk.Label(schinfowin,text="Method: Static",width=30)
+                if chops[0] == True:
+                    schinfo_slewtypelb.config(text="Method: Chopping")
+                elif chops[0] == False and tracks[0] == True:
+                    schinfo_slewtypelb.config(text="Method: Tracking")
+                schinfo_slewtypelb.pack(fill=tk.BOTH)
+                schinfo_ok = tk.Button(schinfowin,text="Ok",
+                                       command = lambda:closeschinfo(startinghours,finishinghours,schedulefile),
+                                       height = 5)
+                schinfo_ok.pack(fill=tk.X)
+                if startinghours != ['']:
+                    schinfo_remove = tk.Button(schinfowin,text="Remove",
+                                               command = lambda:removeselectedobs(day,month,year,schedulefile,pressedno),
+                                               height = 3)
+                    schinfo_remove.pack(fill=tk.X)
+                else:
+                    schinfo_ok.config(height=9)
+                
+                def closeschinfo(starthrs,finhrs,filetoclose):
+                    try:
+                        for x in range(starthrs[0],finhrs[0]+1):
+                            redden(x)
+                    except:
+                        pass
+                    filetoclose.close()
+                    schinfowin.destroy()
+                    
+                #On exit, close up properly and re-redden the numbers selected if necessary.
+                schinfowin.protocol("WM_DELETE_WINDOW", lambda: closeschinfo(startinghours,finishinghours,schedulefile))
+                
+                schinfowin.mainloop()
+            
+            #Base window setup. Again, messy but it needs to be done. Multiple frames and pack could have been
+            #used but this works just as well and offers additional customisation below.
+            schwin = tk.Toplevel()
+            schwin.title("Observing Schedule <IN UTC>")
+            schwin.resizable(0,0)
+            
+            schwin.columnconfigure(0,minsize=2)
+            schwin.columnconfigure(1,minsize=2)
+            schwin.columnconfigure(2,minsize=2)
+            schwin.columnconfigure(3,minsize=2)
+            schwin.columnconfigure(4,minsize=2)
+            schwin.columnconfigure(5,minsize=2)
+            schwin.columnconfigure(6,minsize=2)
+            schwin.columnconfigure(7,minsize=2)
+            schwin.columnconfigure(8,minsize=2)
+            schwin.columnconfigure(9,minsize=2)
+            schwin.columnconfigure(10,minsize=2)
+            schwin.columnconfigure(11,minsize=2)
+            schwin.columnconfigure(12,minsize=2)
+            schwin.columnconfigure(13,minsize=2)
+            schwin.columnconfigure(14,minsize=2)
+            schwin.columnconfigure(15,minsize=2)
+            schwin.columnconfigure(16,minsize=2)
+            schwin.columnconfigure(17,minsize=2)
+            schwin.columnconfigure(18,minsize=2)
+            schwin.columnconfigure(19,minsize=2)
+            schwin.columnconfigure(20,minsize=2)
+            schwin.columnconfigure(21,minsize=2)
+            schwin.columnconfigure(22,minsize=2)
+            schwin.columnconfigure(23,minsize=2)
+            
+            schwin.rowconfigure(0,minsize=5)
+            schwin.rowconfigure(1,minsize=5)
+            schwin.rowconfigure(2,minsize=5)
+            schwin.rowconfigure(3,minsize=5)
+            schwin.rowconfigure(4,minsize=5)
+            
+            #Open in the middle of the screen.
+            scrwidth = schwin.winfo_screenwidth()
+            scrheight = schwin.winfo_screenheight()
+            
+            schw = 436
+            schh = 170
+            
+            schx = scrwidth/2 - schw/2
+            schy = scrheight/2 - schh/2
+            schwin.geometry('%dx%d+%d+%d'% (schw,schh,schx,schy))
+            
+            schframe = tk.Frame(schwin,name="schframe")
+            schframe.grid(row=0,column=0,rowspan=3,columnspan=24)
+            
+            #Separators for a neater inteface
+            horizline1 = ttk.Separator(schframe,orient=tk.HORIZONTAL)
+            horizline1.grid(row=1,column=0,columnspan=24,sticky=tk.N+tk.E+tk.S+tk.W)
+            horizline2 = ttk.Separator(schframe,orient=tk.HORIZONTAL)
+            horizline2.grid(row=3,column=0,columnspan=24,sticky=tk.N+tk.E+tk.S+tk.W)
+            
+            #All the Hour labels defined here and setup for double-click routine
+            hour_0 = tk.Label(schframe,text="0",width=2,background='green',name="hour_0")
+            hour_0.grid(row=2,column=0)
+            hour_0.bind("<Double-Button-1>",lambda event:displayschinfo(event,0))
+            hour_1 = tk.Label(schframe,text="1",width=2,background='green',name="hour_1")
+            hour_1.grid(row=2,column=1)
+            hour_1.bind("<Double-Button-1>",lambda event:displayschinfo(event,1))
+            hour_2 = tk.Label(schframe,text="2",width=2,background='green',name="hour_2")
+            hour_2.grid(row=2,column=2)
+            hour_2.bind("<Double-Button-1>",lambda event:displayschinfo(event,2))
+            hour_3 = tk.Label(schframe,text="3",width=2,background='green',name="hour_3")
+            hour_3.grid(row=2,column=3)
+            hour_3.bind("<Double-Button-1>",lambda event:displayschinfo(event,3))
+            hour_4 = tk.Label(schframe,text="4",width=2,background='green',name="hour_4")
+            hour_4.grid(row=2,column=4)
+            hour_4.bind("<Double-Button-1>",lambda event:displayschinfo(event,4))
+            hour_5 = tk.Label(schframe,text="5",width=2,background='green',name="hour_5")
+            hour_5.grid(row=2,column=5)
+            hour_5.bind("<Double-Button-1>",lambda event:displayschinfo(event,5))
+            hour_6 = tk.Label(schframe,text="6",width=2,background='green',name="hour_6")
+            hour_6.grid(row=2,column=6)
+            hour_6.bind("<Double-Button-1>",lambda event:displayschinfo(event,6))
+            hour_7 = tk.Label(schframe,text="7",width=2,background='green',name="hour_7")
+            hour_7.grid(row=2,column=7)
+            hour_7.bind("<Double-Button-1>",lambda event:displayschinfo(event,7))
+            hour_8 = tk.Label(schframe,text="8",width=2,background='green',name="hour_8")
+            hour_8.grid(row=2,column=8)
+            hour_8.bind("<Double-Button-1>",lambda event:displayschinfo(event,8))
+            hour_9 = tk.Label(schframe,text="9",width=2,background='green',name="hour_9")
+            hour_9.grid(row=2,column=9)
+            hour_9.bind("<Double-Button-1>",lambda event:displayschinfo(event,9))
+            hour_10 = tk.Label(schframe,text="10",width=2,background='green',name="hour_10")
+            hour_10.grid(row=2,column=10)
+            hour_10.bind("<Double-Button-1>",lambda event:displayschinfo(event,10))
+            hour_11 = tk.Label(schframe,text="11",width=2,background='green',name="hour_11")
+            hour_11.grid(row=2,column=11)
+            hour_11.bind("<Double-Button-1>",lambda event:displayschinfo(event,11))
+            hour_12 = tk.Label(schframe,text="12",width=2,background='green',name="hour_12")
+            hour_12.grid(row=2,column=12)
+            hour_12.bind("<Double-Button-1>",lambda event:displayschinfo(event,12))
+            hour_13 = tk.Label(schframe,text="13",width=2,background='green',name="hour_13")
+            hour_13.grid(row=2,column=13)
+            hour_13.bind("<Double-Button-1>",lambda event:displayschinfo(event,13))
+            hour_14 = tk.Label(schframe,text="14",width=2,background='green',name="hour_14")
+            hour_14.grid(row=2,column=14)
+            hour_14.bind("<Double-Button-1>",lambda event:displayschinfo(event,14))
+            hour_15 = tk.Label(schframe,text="15",width=2,background='green',name="hour_15")
+            hour_15.grid(row=2,column=15)
+            hour_15.bind("<Double-Button-1>",lambda event:displayschinfo(event,15))
+            hour_16 = tk.Label(schframe,text="16",width=2,background='green',name="hour_16")
+            hour_16.grid(row=2,column=16)
+            hour_16.bind("<Double-Button-1>",lambda event:displayschinfo(event,16))
+            hour_17 = tk.Label(schframe,text="17",width=2,background='green',name="hour_17")
+            hour_17.grid(row=2,column=17)
+            hour_17.bind("<Double-Button-1>",lambda event:displayschinfo(event,17))
+            hour_18 = tk.Label(schframe,text="18",width=2,background='green',name="hour_18")
+            hour_18.grid(row=2,column=18)
+            hour_18.bind("<Double-Button-1>",lambda event:displayschinfo(event,18))
+            hour_19 = tk.Label(schframe,text="19",width=2,background='green',name="hour_19")
+            hour_19.grid(row=2,column=19)
+            hour_19.bind("<Double-Button-1>",lambda event:displayschinfo(event,19))
+            hour_20 = tk.Label(schframe,text="20",width=2,background='green',name="hour_20")
+            hour_20.grid(row=2,column=20)
+            hour_20.bind("<Double-Button-1>",lambda event:displayschinfo(event,20))
+            hour_21 = tk.Label(schframe,text="21",width=2,background='green',name="hour_21")
+            hour_21.grid(row=2,column=21)
+            hour_21.bind("<Double-Button-1>",lambda event:displayschinfo(event,21))
+            hour_22 = tk.Label(schframe,text="22",width=2,background='green',name="hour_22")
+            hour_22.grid(row=2,column=22)
+            hour_22.bind("<Double-Button-1>",lambda event:displayschinfo(event,22))
+            hour_23 = tk.Label(schframe,text="23",width=2,background='green',name="hour_23")
+            hour_23.grid(row=2,column=23)
+            hour_23.bind("<Double-Button-1>",lambda event:displayschinfo(event,23))
+            
+            #Get the current date and enter it by default into the schedule navigator.
+            initialdate = datetime.date.today()
+            inityr = tk.StringVar(schframe,value=str(initialdate.year))
+            initdy = tk.StringVar(schframe,value=str(initialdate.day))
+            initmo = tk.StringVar(schframe,value=str(initialdate.month))
+            
+            dy_ent =tk.Entry(schframe,textvariable=initdy,width=4,justify=tk.CENTER)
+            dy_ent.grid(row=0,column = 8,columnspan=2)
+            dy_ent.bind('<Return>',lambda event:confirmdate.invoke())
+            
+            mo_ent =tk.Entry(schframe,textvariable=initmo,width=4,justify=tk.CENTER)
+            mo_ent.grid(row=0,column = 11,columnspan=2)
+            mo_ent.bind('<Return>',lambda event:confirmdate.invoke())
+            
+            yr_ent =tk.Entry(schframe,textvariable=inityr,width=4,justify=tk.CENTER)
+            yr_ent.grid(row=0,column = 14,columnspan=2)
+            yr_ent.bind('<Return>',lambda event:confirmdate.invoke())
+            
+            dylab = tk.Label(schframe,text='-',width=2)
+            dylab.grid(row=0,column=10)
+            molab = tk.Label(schframe,text='-',width=2)
+            molab.grid(row=0,column=13)
+            
+            #More widgets! These are for schedule information entry.
+            confirmdate = tk.Button(schframe,text="Go",
+                                    command=lambda: enterdate(dy_ent.get(),mo_ent.get(),yr_ent.get()),width=1)
+            confirmdate.grid(row=0,column=20,columnspan=2)
+            
+            sthr_ent = tk.Entry(schframe,width=4,justify=tk.CENTER)
+            sthr_ent.grid(row=4,column=6,columnspan=2)
+            sthr_lab = tk.Label(schframe,width=11,text="Start Hour:")
+            sthr_lab.grid(row=4,column=0,columnspan=5,sticky=tk.N+tk.E+tk.S+tk.W)
+            
+            fnhr_ent = tk.Entry(schframe,width=4,justify=tk.CENTER)
+            fnhr_ent.grid(row=5,column=6,columnspan=2,sticky=tk.N+tk.E+tk.S+tk.W)
+            fnhr_lab = tk.Label(schframe,width=11,text = "End Hour:")
+            fnhr_lab.grid(row=5,column=0,columnspan=5)
+            
+            obj_ent = ttk.Combobox(schframe, values=["Sun", "Moon", "Cassiopeia A", "Sagittarius A", "Cygnus A",
+                                                                   "Crab Nebula"], state="readonly", width=12)
+            obj_ent.grid(row=6,column=4,columnspan=6,sticky=tk.N+tk.E+tk.S+tk.W)
+            obj_lab = tk.Label(schframe, width = 8,text="Object:")
+            obj_lab.grid(row=6,column=0,columnspan = 4,sticky=tk.N+tk.E+tk.S+tk.W)
+            
+            author_ent = tk.Entry(schframe,width=12)
+            author_ent.grid(row=7,column=4,columnspan=6,sticky=tk.N+tk.E+tk.S+tk.W)
+            author_lab = tk.Label(schframe,width=8,text = "Author:")
+            author_lab.grid(row=7,column=0,columnspan=4,sticky=tk.N+tk.E+tk.S+tk.W)
+            
+            note_ent = tk.Text(schframe,width = 24,height=4)
+            note_ent.grid(row=5,column=11,columnspan=12,rowspan = 4,sticky=tk.N+tk.E+tk.S+tk.W)
+            note_lab = tk.Label(schframe,width=20,text = "Schedule Note w/ email:")
+            note_lab.grid(row=4,column=11,columnspan=10,sticky=tk.N+tk.E+tk.S+tk.W)
+            
+            track_check = tk.BooleanVar()
+            track_checkbox = tk.Checkbutton(schframe,variable=track_check)
+            track_checkbox.grid(row=8,column=4,columnspan=2)
+            track_lab = tk.Label(schframe,width=8,text= "Track?:")
+            track_lab.grid(row=8,column=0,columnspan=4,sticky=tk.N+tk.E+tk.S+tk.W)
+            
+            chop_check = tk.BooleanVar()
+            chop_checkbox = tk.Checkbutton(schframe,variable=chop_check)
+            chop_checkbox.grid(row=9,column=4,columnspan=2)
+            chop_lab = tk.Label(schframe,width=8,text = "Chop?:")
+            chop_lab.grid(row=9,column=0,columnspan=4,sticky=tk.N+tk.E+tk.S+tk.W)
+            
+            save_schedulebutton = tk.Button(schframe,text="Save Schedule",
+                                            command=lambda:saveobsslot(dy_ent.get(),mo_ent.get(),yr_ent.get(),
+                                                                       sthr_ent.get(),fnhr_ent.get(),obj_ent.get(),
+                                                                       author_ent.get(),note_ent.get("1.0",'end-1c'),
+                                                                       track_check.get(),chop_check.get()),width=14)
+            save_schedulebutton.grid(row=9,column = 16,columnspan=7)
+            
+            gobackbutton = tk.Button(schframe,text="Back",command=lambda:closeupwindow(),width=8)
+            gobackbutton.grid(row=9,column=11,columnspan=6)
+            
+            #Fire off the date confirmation once so the scheduler shows the right information on launch.
+            confirmdate.invoke()
+            
+            def closeupwindow():
+                schwin.destroy()
+            
+            #Closing protocol.
+            schwin.protocol("WM_DELETE_WINDOW", lambda: closeupwindow())
+            schwin.mainloop()
+
+        def coorddrive(handler=False):
+            # This sets up the driver to drive to the requested coordinates
+            # First, check which coordinate system was selected /fp
+            
+            if coordsyschoice.get() == "":
+                missinginputerror("a coordinate system.")
+                return
+                # The above should display a popup with that error message and break out of this function
+                # Can't run at all without a coordinate system
+                # Want to keep the interface's input so it can be easily fixed
+            else:
+                # This value will be used later when coordinate conversions need done
+                choice = coordsyschoice.get()
+            # Next, get horizontal coordinates
+            # The below code is the series of checks to make sure the input provided is sensible
+            # Details for the formatting it demands should go on the wiki
+            # To do: all error messages as popups
+            if len(horizdeg.get()) > 0:
+                try:
+                    horizdegval = int(horizdeg.get())
+                    horizdecimaldeg = horizdegval
+                    if horizdecimaldeg < 0 or horizdecimaldeg > 360:
+                        invalidinputerror("a horizontal degree value between 0 and 360.")
+                        return
+                    else:
+                        pass
+                    if len(horizmin.get()) > 0:
+                        try:
+                            horizminval = int(horizmin.get())
+                            if horizminval < 0 or horizminval >= 60:
+                                invalidinputerror("a horizontal minute value between 0 and 60.")
+                                return
+                            else:
+                                pass
+                            horizdecimalmin = horizminval/60
+                            if len(horizsec.get()) > 0:
+                                try:
+                                    horizsecval = int(horizsec.get())
+                                    if horizsecval < 0 or horizsecval >= 60:
+                                        invalidinputerror("a horizontal second value between 0 and 60.")
+                                        return
+                                    else:
+                                        pass
+                                    horizdecimalsec = horizsecval/3600
+                                    horizdecimaltotal = horizdecimaldeg + horizdecimalmin + horizdecimalsec
+                                except ValueError:
+                                    try:
+                                        horizsecval = float(horizsec.get())
+                                        if horizminval < 0 or horizminval >= 60:
+                                            invalidinputerror("a horizontal minute value between 0 and 60.")
+                                            return
+                                        else:
+                                            pass
+                                        horizdecimalsec = horizsecval/3600
+                                        horizdecimaltotal = horizdecimaldeg + horizdecimalmin + horizdecimalsec
+                                    except ValueError:
+                                        invalidinputerror("coordinates as numbers only.")
+                                        return
+                            else:
+                                horizdecimaltotal = horizdecimaldeg + horizdecimalmin
+                        except ValueError:
+                            try:
+                                horizminval = float(horizmin.get())
+                                if horizminval < 0 or horizminval >= 60:
+                                    invalidinputerror("a horizontal minute value between 0 and 60.")
+                                    return
+                                else:
+                                    pass
+                                horizdecimalmin = horizminval/60
+                                horizdecimaltotal = horizdecimaldeg + horizdecimalmin
+                                if len(horizsec.get()) > 0:
+                                    invalidinputerror("coordinates using the style provided by the wiki.")
+                                    return
+                                else:
+                                    pass
+                            except ValueError:
+                                invalidinputerror("coordinates as numbers only.")
+                                return
+                    elif len(horizsec.get()) > 0:
+                        try:
+                            horizsecval = int(horizsec.get())
+                            if horizsecval < 0 or horizsecval >= 60:
+                                invalidinputerror("a horizontal second value between 0 and 60.")
+                                return
+                            else:
+                                pass
+                            horizdecimalsec = horizsecval / 3600
+                            horizdecimaltotal = horizdecimaldeg + horizdecimalsec
+                        except ValueError:
+                            try:
+                                horizsecval = float(horizsec.get())
+                                if horizsecval < 0 or horizsecval >= 60:
+                                    invalidinputerror("a horizontal minute value between 0 and 60.")
+                                    return
+                                else:
+                                    pass
+                                horizdecimalsec = horizsecval / 3600
+                                horizdecimaltotal = horizdecimaldeg + horizdecimalsec
+                            except ValueError:
+                                invalidinputerror("coordinates as numbers only.")
+                                return
+                    else:
+                        horizdecimaltotal = horizdecimaldeg
+                except ValueError:
+                    try:
+                        horizdegval = float(horizdeg.get())
+                        if horizdegval < 0 or horizdegval >= 60:
+                            invalidinputerror("a horizontal degree value between 0 and 360.")
+                            return
+                        else:
+                            pass
+                        horizdecimaldeg = horizdegval
+                        horizdecimaltotal = horizdecimaldeg
+                        if len(horizmin.get()) > 0:
+                            invalidinputerror("coordinates using the style provided by the wiki.")
+                            return
+                        elif len(horizsec.get()) > 0:
+                            invalidinputerror("coordinates using the style provided by the wiki.")
+                            return
+                        else:
+                            pass
+                    except ValueError:
+                        invalidinputerror("coordinates as numbers only.")
+                        return
+            elif len(horizmin.get()) > 0:
+                try:
+                    horizminval = int(horizmin.get())
+                    if horizminval < 0 or horizminval >= 60:
+                        invalidinputerror("a horizontal minute value between 0 and 60.")
+                        return
+                    else:
+                        pass
+                    horizdecimalmin = horizminval/60
+                    if len(horizsec.get()) > 0:
+                        try:
+                            horizsecval = int(horizsec.get())
+                            if horizsecval < 0 or horizsecval >= 60:
+                                invalidinputerror("a horizontal second value between 0 and 60.")
+                                return
+                            else:
+                                pass
+                            horizdecimalsec = horizsecval/3600
+                            horizdecimaltotal = horizdecimalmin + horizdecimalsec
+                        except ValueError:
+                            try:
+                                horizsecval = float(horizsec.get())
+                                if horizsecval < 0 or horizsecval >= 60:
+                                    invalidinputerror("a horizontal second value between 0 and 60.")
+                                    return
+                                else:
+                                    pass
+                                horizdecimalsec = horizsecval/3600
+                                horizdecimaltotal = horizdecimalmin + horizdecimalsec
+                            except ValueError:
+                                invalidinputerror("coordinates as numbers only.")
+                                return
+                    else:
+                        horizdecimaltotal = horizdecimalmin
+                except ValueError:
+                    try:
+                        horizminval = float(horizmin.get())
+                        if horizminval < 0 or horizminval >= 60:
+                            invalidinputerror("a horizontal minute value between 0 and 60.")
+                            return
+                        else:
+                            pass
+                        horizdecimalmin = horizminval/60
+                        horizdecimaltotal = horizdecimalmin
+                        if len(horizsec.get()) > 0:
+                            invalidinputerror("coordinates using the style provided by the wiki.")
+                            return
+                        else:
+                            pass
+                    except ValueError:
+                        invalidinputerror("coordinates as numbers only.")
+                        return
+            elif len(horizsec.get()) > 0:
+                try:
+                    horizsecval = int(horizsec.get())
+                    if horizsecval < 0 or horizsecval >= 60:
+                        invalidinputerror("a horizontal second value between 0 and 60.")
+                        return
+                    else:
+                        pass
+                    horizdecimalsec = horizsecval/3600
+                    horizdecimaltotal = horizdecimalsec
+                except ValueError:
+                    try:
+                        horizsecval = float(horizsec.get())
+                        if horizsecval < 0 or horizsecval >= 60:
+                            invalidinputerror("a horizontal second value between 0 and 60.")
+                            return
+                        else:
+                            pass
+                        horizdecimalsec = horizsecval/3600
+                        horizdecimaltotal = horizdecimalsec
+                    except ValueError:
+                        invalidinputerror("coordinates as numbers only.")
+                        return
+            else:
+                missinginputerror("a horizontal coordinate.")
+                return
+            # Next, get vertical coordinates
+            # The below code is the series of checks to make sure the input provided is sensible
+            if len(vertdeg.get()) > 0:
+                isnegative = tk.BooleanVar(mainnavinterface)
+                isnegative.set(False)
+                try:
+                    vertdegval = int(vertdeg.get())
+                    if vertdegval < -90 or vertdegval > 90:
+                        missinginputerror("a vertical degree value between -90 and 90.")
+                        return
+                    else:
+                        pass
+                    if vertdegval < 0:
+                        isnegative.set(True)
+                        vertdegval = abs(vertdegval)
+                    else:
+                        pass
+                    vertdecimaldeg = vertdegval
+                    if len(vertmin.get()) > 0:
+                        try:
+                            vertminval = int(vertmin.get())
+                            if vertminval < 0 or vertminval >= 60:
+                                invalidinputerror("a vertical minute value between 0 and 60.")
+                                return
+                            else:
+                                pass
+                            vertdecimalmin = vertminval / 60
+                            if len(vertsec.get()) > 0:
+                                try:
+                                    vertsecval = int(vertsec.get())
+                                    if vertsecval < 0 or vertsecval >= 60:
+                                        invalidinputerror("a vertical second value between 0 and 60.")
+                                        return
+                                    else:
+                                        pass
+                                    vertdecimalsec = vertsecval / 3600
+                                    vertdecimaltotal = vertdecimaldeg + vertdecimalmin + vertdecimalsec
+                                except ValueError:
+                                    try:
+                                        vertsecval = float(vertsec.get())
+                                        if vertsecval < 0 or vertsecval >= 60:
+                                            invalidinputerror("a vertical second value between 0 and 60.")
+                                            return
+                                        else:
+                                            pass
+                                        vertdecimalsec = vertsecval / 3600
+                                        vertdecimaltotal = vertdecimaldeg + vertdecimalmin + vertdecimalsec
+                                    except ValueError:
+                                        invalidinputerror("coordinates as numbers only.")
+                                        return
+                            else:
+                                vertdecimaltotal = vertdecimaldeg + vertdecimalmin
+                        except ValueError:
+                            try:
+                                vertminval = float(vertmin.get())
+                                if vertminval < 0 or vertminval >= 60:
+                                    invalidinputerror("a vertical minute value between 0 and 60.")
+                                    return
+                                else:
+                                    pass
+                                vertdecimalmin = vertminval / 60
+                                vertdecimaltotal = vertdecimaldeg + vertdecimalmin
+                                if len(vertsec.get()) > 0:
+                                    invalidinputerror("coordinates using the style provided by the wiki.")
+                                    return
+                                else:
+                                    pass
+                            except ValueError:
+                                invalidinputerror("coordinates as numbers only.")
+                                return
+                    elif len(vertsec.get()) > 0:
+                        try:
+                            vertsecval = int(vertsec.get())
+                            if vertsecval < 0 or vertsecval >= 60:
+                                invalidinputerror("a vertical second value between 0 and 60.")
+                                return
+                            else:
+                                pass
+                            vertdecimalsec = vertsecval / 3600
+                            vertdecimaltotal = vertdecimaldeg + vertdecimalsec
+                        except ValueError:
+                            try:
+                                vertsecval = float(vertsec.get())
+                                if vertsecval < 0 or vertsecval >= 60:
+                                    invalidinputerror("a vertical second value between 0 and 60.")
+                                    return
+                                else:
+                                    pass
+                                vertdecimalsec = vertsecval / 3600
+                                vertdecimaltotal = vertdecimaldeg + vertdecimalsec
+                            except ValueError:
+                                invalidinputerror("coordinates as numbers only.")
+                                return
+                    else:
+                        vertdecimaltotal = vertdecimaldeg
+                except ValueError:
+                    try:
+                        vertdegval = float(vertdeg.get())
+                        if vertdegval < -90 or vertdegval > 90:
+                            invalidinputerror("a vertical degree value between -90 and 90.")
+                            return
+                        else:
+                            pass
+                        vertdecimaldeg = vertdegval
+                        vertdecimaltotal = vertdecimaldeg
+                        if len(vertmin.get()) > 0:
+                            invalidinputerror("coordinates using the style provided by the wiki.")
+                            return
+                        else:
+                            pass
+                        if len(vertsec.get()) > 0:
+                            invalidinputerror("coordinates using the style provided by the wiki.")
+                            return
+                        else:
+                            pass
+                    except ValueError:
+                        invalidinputerror("coordinates as numbers only.")
+                        return
+            elif len(vertmin.get()) > 0:
+                try:
+                    vertminval = int(vertmin.get())
+                    if vertminval < 0 or vertminval >= 60:
+                        invalidinputerror("a vertical minute value between 0 and 60.")
+                        return
+                    else:
+                        pass
+                    vertdecimalmin = vertminval / 60
+                    if len(vertsec.get()) > 0:
+                        try:
+                            vertsecval = int(vertsec.get())
+                            if vertsecval < 0 or vertsecval >= 60:
+                                invalidinputerror("a vertical second value between 0 and 60.")
+                                return
+                            else:
+                                pass
+                            vertdecimalsec = vertsecval / 3600
+                            vertdecimaltotal = vertdecimalmin + vertdecimalsec
+                        except ValueError:
+                            try:
+                                vertsecval = float(vertsec.get())
+                                if vertsecval < 0 or vertsecval >= 60:
+                                    invalidinputerror("a vertical second value between 0 and 60.")
+                                    return
+                                else:
+                                    pass
+                                vertdecimalsec = vertsecval / 3600
+                                vertdecimaltotal = vertdecimalmin + vertdecimalsec
+                            except ValueError:
+                                invalidinputerror("coordinates as numbers only.")
+                                return
+                    else:
+                        vertdecimaltotal = vertdecimalmin
+                except ValueError:
+                    try:
+                        vertminval = float(vertmin.get())
+                        if vertminval < 0 or vertminval >= 60:
+                            invalidinputerror("a vertical minute value between 0 and 60.")
+                            return
+                        else:
+                            pass
+                        vertdecimalmin = vertminval / 60
+                        vertdecimaltotal = vertdecimalmin
+                        if len(vertsec.get()) > 0:
+                            invalidinputerror("coordinates using the style provided by the wiki.")
+                            return
+                        else:
+                            pass
+                    except ValueError:
+                        invalidinputerror("coordinates as numbers only.")
+                        return
+            elif len(vertsec.get()) > 0:
+                try:
+                    vertsecval = int(vertsec.get())
+                    if vertsecval < 0 or vertsecval >= 60:
+                        invalidinputerror("a vertical second value between 0 and 60.")
+                        return
+                    else:
+                        pass
+                    vertdecimalsec = vertsecval / 3600
+                    vertdecimaltotal = vertdecimalsec
+                except ValueError:
+                    try:
+                        vertsecval = float(vertsec.get())
+                        if vertsecval < 0 or vertsecval >= 60:
+                            invalidinputerror("a vertical second value between 0 and 60.")
+                            return
+                        else:
+                            pass
+                        vertdecimalsec = vertsecval / 3600
+                        vertdecimaltotal = vertdecimalsec
+                    except ValueError:
+                        invalidinputerror("coordinates as numbers only.")
+                        return
+            else:
+                missinginputerror("a vertical coordinate.")
+                return
+            # Handling negative inputs separately, else the addition is -d + m + s rather than -d - m -s as should be
+            if isnegative is True:
+                vertdecimaltotal = -vertdecimaltotal
+            else:
+                pass
+    
+            horizradiantotal = math.radians(horizdecimaltotal)
+            vertradiantotal = math.radians(vertdecimaltotal)
+    
+            # Convert the coordinates into az-el if they're not already
+            # No error-handling included here, as the coordinate choice was already validated earlier
+            if choice == "Ecliptic":
+                skylocation = ephem.Equatorial(ephem.Ecliptic(horizradiantotal, vertradiantotal))
+                referencestar = ephem.FixedBody()
+                referencestar._ra = skylocation.ra
+                referencestar._dec = skylocation.dec
+                referencestar.compute(mylocation)
+                gotoaz = math.degrees(referencestar.az)
+                gotoel = math.degrees(referencestar.alt)
+            elif choice == "Equatorial":
+                skylocation = ephem.Equatorial(horizradiantotal, vertradiantotal)
+                referencestar = ephem.FixedBody()
+                referencestar._ra = skylocation.ra
+                referencestar._dec = skylocation.dec
+                referencestar.compute(mylocation)
+                gotoaz = math.degrees(referencestar.az)
+                gotoel = math.degrees(referencestar.alt)
+            elif choice == "Galactic":
+                skylocation = ephem.Equatorial(ephem.Galactic(horizradiantotal, vertradiantotal))
+                referencestar = ephem.FixedBody()
+                referencestar._ra = skylocation.ra
+                referencestar._dec = skylocation.dec
+                referencestar.compute(mylocation)
+                gotoaz = math.degrees(referencestar.az)
+                gotoel = math.degrees(referencestar.alt)
+            else:
+                gotoaz = horizdecimaltotal
+                gotoel = vertdecimaltotal
+    
+            if gotoel < 0:
+                coordunavailableerror()
+                Stop_Drive()
+                return
+            else:
+                pass
+            # The driver has limited precision (0.1 degree/6 minutes) so this rounds the result
+            # In practical terms, the seconds in any coordinate system won't make much difference to where the telescope
+            # goes; however, the functionality's been left in so if the code is ever reused for another drive, it's
+            # available if needed
+            gotoaz = round(gotoaz*10)/10
+            gotoel = round(gotoel*10)/10
+            
+            #If chopping is enabled, perform the incremental step here.
+            if mainnavinterface.chopvar == True and mainnavinterface.chopchoice.get()== True:
+                gotoaz = gotoaz + round(0.1*int(mainnavinterface.chopdist/6,1))
+            mainnavinterface.coord_statusupdate = (str(gotoaz)+","+str(gotoel))
+            if handler == True:
+                return
+            Set_Drive(gotoaz, gotoel)
+            
+            #Chopping period will be customisable, for now it is directly input here.
+            if mainnavinterface.chopchoice.get() == True:
+                if mainnavinterface.chopflag == True:
+                    mainnavinterface.chopvar = not mainnavinterface.chopvar
+                    mainnavinterface.afterid = mainnavinterface.after(mainnavinterface.chopperiod, coorddrive)
+                #To allow the mount to slew first, a minute's grace period is given for a standard slew.
+                elif mainnavinterface.chopflag == False:
+                    mainnavinterface.chopflag = True
+                    mainnavinterface.after(mainnavinterface.chopgrace, coorddrive)
+            # Tracking updates the position every 15 seconds for ease of use later in calculations.
+            elif mainnavinterface.chopchoice.get() == False and coordtrackchoice.get() == True and choice is not "Horizontal":
+                mainnavinterface.afterid = mainnavinterface.after(15000, coorddrive)
+                
+        def objdrive(handler=False):
+            # This directs the driver to any desired object on the list /fp
+            if objchoice.get() == "":
+                missinginputerror("an object.")
+                return
+            elif objchoice.get() == "Sun":
+                drivetoobj = ephem.Sun(mylocation)
+                gotoaz = math.degrees(drivetoobj.az)
+                gotoel = math.degrees(drivetoobj.alt)
+            elif objchoice.get() == "Moon":
+                drivetoobj = ephem.Moon(mylocation)
+                gotoaz = drivetoobj.az
+                gotoel = drivetoobj.alt
+            elif objchoice.get() == "Cassiopeia A":
+                drivetoobj = ephem.readdb("Casseopeia A,f,23:23:24.01,58:48:54.0,6,2000")
+                drivetoobj.compute(mylocation)
+                gotoaz = drivetoobj.az
+                gotoel = drivetoobj.alt
+            elif objchoice.get() == "Sagittarius A":
+                drivetoobj = ephem.readdb("Sagittarius A*,f,17:45:40.04,-29:0:28.2,25,2000")
+                drivetoobj.compute(mylocation)
+                gotoaz = drivetoobj.az
+                gotoel = drivetoobj.alt
+            elif objchoice.get() == "Cygnus A":
+                drivetoobj = ephem.readdb("Cygnus A,f,19:59:28.36,40:44:02.1,16,2000")
+                drivetoobj.compute(mylocation)
+                gotoaz = drivetoobj.az
+                gotoel = drivetoobj.alt
+            elif objchoice.get() == "Crab Nebula":
+                drivetoobj = ephem.readdb("Crab Nebula,f,5:34:31.94,22:00:52.2,8.5,2000")
+                drivetoobj.compute(mylocation)
+                gotoaz = drivetoobj.az
+                gotoel = drivetoobj.alt
+            # A check to ensure the object is visible before attempting to drive to it
+            if gotoel < 0:
+                if objtrackchoice.get() == True:
+                    prevset = mylocation.previous_setting(drivetoobj),
+                    nextrise = mylocation.next_rising(drivetoobj)
+                    timetillrise = round((nextrise-prevset)*24*60*60*1000)
+                    mainnavinterface.after(timetillrise, objdrive)
+                else:
+                    coordunavailableerror()
+                    Stop_Drive()
+                    return
+            else:
+                if mainnavinterface.chopvar == True and mainnavinterface.chopchoice.get()== True:
+                    gotoaz = gotoaz + round(0.1*mainnavinterface.chopdist/6,1)
+                if handler == True:
+                    return
+                Set_Drive(gotoaz, gotoel)
+            #azdifference = abs(gotoaz - float(Az.get()))
+            #eldifference = abs(gotoel - float(El.get()))
+            #maxdifference = round(max(azdifference, eldifference))
+            #timetowait = maxdifference*500
+            #Chopping period will be customisable, for now it is directly input here.
+            if mainnavinterface.chopchoice.get() == True:
+                if mainnavinterface.chopflag == True:
+                    mainnavinterface.chopvar = not mainnavinterface.chopvar
+                    mainnavinterface.afterid = mainnavinterface.after(mainnavinterface.chopperiod, objdrive)
+                #To allow the mount to slew first, a minute's grace period is given for a standard slew.
+                elif mainnavinterface.chopflag == False:
+                    mainnavinterface.chopflag = True
+                    mainnavinterface.after(mainnavinterface.chopgrace, objdrive)
+            # Tracking updates every 15 seconds for easy maths when working with other software.
+            if objtrackchoice.get() == True:
+                mainnavinterface.afterid = mainnavinterface.after(15000, objdrive)
+            
+    
+    
+        def getriseset():
+            # Generating the rising and setting times for each body /fp
+            if objchoice.get() == "":
+                missinginputerror("an object.")
+                return
+            elif objchoice.get() == "Sun":
+                findriseset = ephem.Sun(mylocation)
+            elif objchoice.get() == "Moon":
+                findriseset = ephem.Moon(mylocation)
+            elif objchoice.get() == "Cassiopeia A":
+                findriseset = ephem.readdb("Casseopeia A,f,23:23:24.01,58:48:54.0,6,2000")
+                findriseset.compute(mylocation)
+            elif objchoice.get() == "Sagittarius A":
+                findriseset = ephem.readdb("Sagittarius A*,f,17:45:40.04,-29:0:28.2,25,2000")
+                findriseset.compute(mylocation)
+            elif objchoice.get() == "Cygnus A":
+                findriseset = ephem.readdb("Cygnus A,f,19:59:28.36,40:44:02.1,16,2000")
+                findriseset.compute(mylocation)
+            elif objchoice.get() == "Crab Nebula":
+                findriseset = ephem.readdb("Crab Nebula,f,5:34:31.94,22:00:52.2,8.5,2000")
+                findriseset.compute(mylocation)
+            try:
+                prevrise = mylocation.previous_rising(findriseset)
+                prevset = mylocation.previous_setting(findriseset)
+                nextrise = mylocation.next_rising(findriseset)
+                nextset = mylocation.next_setting(findriseset)
+                # If prevrise > prevset, the object is currently up; if vice versa, the object is currently down
+                # There's a slightly different display depending on which is the case
+                if prevrise > prevset:
+                    risesettext.set("Rose at:\n" + str(prevrise) + "\nSetting at:\n" + str(nextset))
+                else:
+                    risesettext.set("Set at:\n" + str(prevset) + "\nRising at:\n" + str(nextrise))
+                    
+            # Some objects never set; this accounts for them
+            except ephem.AlwaysUpError:
+                risesettext.set("Always Risen")
+        
+        def statusupdate(objchoice,followingsch=False,hourstoobserve=0,is_obj=False,is_coord=False):
+            # Display current status of telescope in a seperate window. Pause-Start control is offered
+            # for ease of use, and the duration and target of current observation is displayed. /ccb
+            
+            #First, some error handling.
+            mainnavinterface.errorflag = False
+            if is_obj==True:
+                objdrive(handler=True)
+                if mainnavinterface.errorflag == True:
+                    return
+            elif is_coord==True:
+                if objchoice == "":
+                    coorddrive(handler=True)
+                    if mainnavinterface.errorflag == True:
+                        mainnavinterface.coord_statusupdate = ""
+                        return
+                    statusupdate(mainnavinterface.coord_statusupdate,is_coord=True)
+                    return
+            #Window assembly, centring, etc.
+            statuswindow = tk.Toplevel()
+            statuswindow.lift()
+            statuswindow.title("Status")
+            statuswindow.resizable(0, 0)
+            
+            statusw = 240
+            statush = 116
+            statusframe = tk.Frame(statuswindow, width=statusw, height=statush, background = "grey")
+            statusframe.tkraise()
+            
+            statusx= int(scrwidth/2 - statusw/2)
+            statusy= int(scrheight/2 - statush/2)
+            
+            statuswindow.geometry('{}x{}+{}+{}'.format(statusw, statush, statusx, statusy))
+            
+            statusframe.rowconfigure(0,minsize=2)
+            statusframe.rowconfigure(1,minsize=2)
+            statusframe.rowconfigure(2,minsize=2)
+            statusframe.rowconfigure(3,minsize=2)
+            statusframe.columnconfigure(0,minsize=30)
+            
+            choppingortrackinglab = tk.Label(statusframe,text="Static",height=2,width=30,background="white")
+            choppingortrackinglab.grid(row=2,column=0)
+            if mainnavinterface.chopchoice.get() == True:
+                choppingortrackinglab.config(text="Chopping: " + str(mainnavinterface.chopdist) + "arcmin")
+                
+            #Differentiate between an object or coordinate input here to ensure the right function is called.
+            if is_obj == True:
+                statusupdatebutton = tk.Button(statusframe,text = "Begin", width = 30, height = 2,
+                                               background="light sky blue", activebackground="deep sky blue",
+                                               command=lambda: [statusinitial(),objdrive()])
+                if objtrackchoice.get() == True and mainnavinterface.chopchoice.get() == False:
+                    choppingortrackinglab.config(text="Tracking Object")
+            elif is_coord == True:
+                statusupdatebutton = tk.Button(statusframe,text = "Begin", width = 30, height = 2,
+                                           background="light sky blue", activebackground="deep sky blue",
+                                           command=lambda: [statusinitial(),coorddrive()])
+                if coordtrackchoice.get() == True and mainnavinterface.chopchoice.get() == False:
+                    choppingortrackinglab.config(text="Tracking Coordinates")
+            
+            statusupdatebutton.grid(row=3,column=0)
+            
+
+            current_objectlabel = tk.Label(statusframe,text="Words",height=2,width=30,background="white")
+            current_objectlabel.grid(row=0,column=0)
+            observetimer = tk.Label(statusframe,text="00:00",height=2,width=30,background="white")
+            observetimer.grid(row=1,column=0)
+            statusframe.grid(row=0, column=0, columnspan=1, rowspan=3)
+            statuswindow.paused = True
+
+            def statusinitial():
+                #Button control function.
+                if statuswindow.paused == True:
+                    statuswindow.paused = False
+                    statuswindow.oldtime = time.time()
+                    statusupdatebutton.config(text="Pause",command=lambda: [statusinitial(),Stop_Drive()])
+                    if is_obj == True:
+                        current_objectlabel.config(text="Current Target: " + objchoice.get())
+                    elif is_coord == True:
+                        current_objectlabel.config(text="Current Target: " + objchoice)
+                    statustick()
+                else:
+                    statuswindow.paused = True
+                    statuswindow.oldtime = time.time()
+                    if is_obj == True:
+                        statusupdatebutton.config(text = "Resume",command=lambda: [statusinitial(),objdrive()])
+                    elif is_coord == True:
+                        statusupdatebutton.config(text = "Resume",command=lambda: [statusinitial(),coorddrive()])
+                    current_objectlabel.config(text= "Waiting")
+                    observetimer.config(text="")
+            
+            def statustick():
+                #Duration-timer handler. Keeps ticking while the observation is in progress, then resets.
+                if statuswindow.paused == True:
+                    return
+                delta = int(time.time()-statuswindow.oldtime)
+                timestr = '{:02}:{:02}'.format(*divmod(delta, 60))
+                observetimer.config(text=timestr)
+                observetimer.after(1000,statustick)
+            
+            #Due to the way it's set up, we need to fire off the button once to kick things off.
+            statusupdatebutton.invoke()
+            
+            #Continue observing until the schedule is done, then bring it to a close a few seconds early
+            #to allow for computation time in case another scheduled observation is planned immediately.
+            if followingsch==True:
+                print('We did it?')
+                statuswindow.after(hourstoobserve*3600*1000 - 5000,statusupdatebutton.invoke)
+            statuswindow.mainloop()            
+            
+        def raise_frame(frame):
+            # The different interface windows are actually just different frames stacked in the same place
+            #and raised as needed. This function performs the raising. /fp
+            frame.tkraise()
+    
+        def savecoords():
+            # Saves chosen home and stow coordinates for future use. /ccb
+            settingsfile = open("settingsfile.txt","w")
+            settingsfile.truncate(0)
+            
+            settingsfile.write(str(homeaz.get())+'\n')
+            settingsfile.write(str(homeel.get())+'\n')
+            settingsfile.write(str(stowaz.get())+'\n')
+            settingsfile.write(str(stowel.get())+'\n')
+            try:
+                settingsfile.write(str(mainnavinterface.chopdist) + '\n')
+                settingsfile.write(str(mainnavinterface.chopperiod) + '\n')
+                settingsfile.write(str(mainnavinterface.chopgrace) + '\n')
+            except:
+                print('no save')
+            settingsfile.close()
+            
+        def chopsetup():
+            #Settings window to change parameters for the 'chopping' observation technique. /ccb
+            
+            #Window setup, centring etc.
+            chopsetupwin = tk.Toplevel()
+            chopw = 173
+            choph = 104
+            chopx = scrwidth/2-chopw/2
+            chopy = scrheight/2-choph/2
+            chopsetupwin.geometry('%dx%d+%d+%d'%(chopw,choph,chopx,chopy))
+            
+            chopsetupwin.title("Chop Setup")
+            chopsetupwin.resizable(0,0)
+            chopsetupwin.lift()
+            
+            chopframe = tk.Frame(chopsetupwin, width=chopw, height=choph, background = "grey")
+            chopframe.grid(row=0,column=0,rowspan=2,columnspan=5)
+            chopframe.tkraise()
+            
+            chopframe.columnconfigure(0,minsize=30)
+            chopframe.columnconfigure(1,minsize=30)
+            
+            chopframe.rowconfigure(0,minsize=25)
+            chopframe.rowconfigure(1,minsize=2)
+            chopframe.rowconfigure(2,minsize=25)
+            chopframe.rowconfigure(3,minsize=20)
+            chopframe.rowconfigure(4,minsize=20)
+            
+            def savechopsets():
+                #Save the chosen parameters.
+                mainnavinterface.chopperiod = chopperiod.get()
+                mainnavinterface.chopdist = chopdist.get()
+                mainnavinterface.chopgrace = chopgrace.get()
+                savecoords()
+            
+            #Widgets - labels and entry boxes, with some formatting.
+            chopdistancelabel = tk.Label(chopframe,text="Chop distance (arcmin):",background="white",
+                                          wraplength=100,justify=tk.CENTER)
+            chopdistancelabel.grid(row=0,column=0,sticky=tk.E+tk.W)
+            chopdist = tk.IntVar()
+            chopdist.set(mainnavinterface.chopdist)
+            chopdistent = tk.Entry(chopframe,width=10,textvariable=chopdist)
+            chopdistent.grid(row=0,column=1,sticky=tk.N+tk.E+tk.S+tk.W)
+            chophoriz1 = ttk.Separator(chopframe,orient=tk.HORIZONTAL)
+            chophoriz1.grid(row=1,column=0,columnspan=2,sticky=tk.N+tk.E+tk.S+tk.W)
+            chopperiodlabel = ttk.Label(chopframe,text="Chop period (ms):",background="white",
+                                        wraplength=100,justify=tk.CENTER)
+            chopperiodlabel.grid(row=2,column=0,sticky=tk.N+tk.E+tk.S+tk.W)
+            chopperiod = tk.IntVar()
+            chopperiod.set(mainnavinterface.chopperiod)
+            chopperiodent = tk.Entry(chopframe,width=10,textvariable=chopperiod)
+            chopperiodent.grid(row=2,column=1,sticky=tk.N+tk.E+tk.S+tk.W)
+            chopgracelabel = ttk.Label(chopframe,text="Grace period (s):",background="white",
+                                       wraplength=100,justify=tk.CENTER)
+            chopgracelabel.grid(row=3,column=0,sticky=tk.N+tk.E+tk.S+tk.W)
+            chopgrace = tk.IntVar()
+            chopgrace.set(mainnavinterface.chopgrace)
+            chopgraceent = tk.Entry(chopframe,width=10,textvariable=chopgrace)
+            chopgraceent.grid(row=3,column=1,sticky=tk.N+tk.E+tk.S+tk.W)
+            chopsavebut = tk.Button(chopframe,text="Save",width=5,background="light sky blue",
+                                    activebackground = "deep sky blue",command = lambda: savechopsets())
+            chopsavebut.grid(row=4,column=1)
+            chopsetupwin.mainloop()
+            
+        # Setting up main interface window
+        # Note: styles won't work unless placed after the mainnavinterface declaration /fp
+        mainnavinterface.deiconify()
+        mainnavinterface.lift()
+        mainnavinterface.title("Navigation Interface")
+        mainnavinterface.resizable(0, 0)
+        
+        #More centering /ccb
+        navw= 530
+        navh = 290
+        navx = scrwidth/2 - navw/2
+        navy = scrheight/2 - navh/2
+        mainnavinterface.geometry('%dx%d+%d+%d'% (navw,navh,navx,navy))
+    
+        # Frame declarations /fp
+        upperframe = ttk.Frame(mainnavinterface, width=500, height=50, style="Upper.TFrame")
+        upperframe.grid(row=0, rowspan=2, columnspan=5)
+        mainframe = ttk.Frame(mainnavinterface, width=500, height=250, style="Lower.TFrame")
+        mainframe.grid(row=2, columnspan=5)
+        coordframe = ttk.Frame(mainnavinterface, width=500, height=250, style="Lower.TFrame")
+        coordframe.grid(row=2, columnspan=3)
+        objframe = ttk.Frame(mainnavinterface, width=500, height=250, style="Lower.TFrame")
+        objframe.grid(row=2)
+        settingsframe = ttk.Frame(mainnavinterface, width=500, height=250, style="Lower.TFrame")
+        settingsframe.grid(row=2)
+    
+        # Setting up frame sizes to allow for correct spacing /fp
+        upperframe.columnconfigure(0, minsize=100)
+        upperframe.columnconfigure(1, minsize=100)
+        upperframe.columnconfigure(2, minsize=100)
+        upperframe.columnconfigure(3, minsize=100)
+        upperframe.columnconfigure(4, minsize=100)
+        
+        upperframe.rowconfigure(0, minsize=15)
+        upperframe.rowconfigure(1, minsize=15)
+        
+        mainframe.columnconfigure(0, minsize=100)
+        mainframe.columnconfigure(1, minsize=100)
+        mainframe.columnconfigure(2, minsize=100)
+        mainframe.columnconfigure(3, minsize=100)
+        mainframe.columnconfigure(4, minsize=110)
+    
+        mainframe.rowconfigure(0, minsize=50)
+        mainframe.rowconfigure(1, minsize=50)
+        mainframe.rowconfigure(2, minsize=50)
+        mainframe.rowconfigure(3, minsize=50)
+        mainframe.rowconfigure(4, minsize=50)
+    
+        coordframe.columnconfigure(0, minsize=150)
+        coordframe.columnconfigure(1, minsize=20)
+        coordframe.columnconfigure(2, minsize=150)
+        coordframe.columnconfigure(3, minsize=20)
+        coordframe.columnconfigure(4, minsize=150)
+    
+        coordframe.rowconfigure(0, minsize=40)
+        coordframe.rowconfigure(1, minsize=40)
+        coordframe.rowconfigure(2, minsize=20)
+        coordframe.rowconfigure(3, minsize=40)
+        coordframe.rowconfigure(4, minsize=40)
+        coordframe.rowconfigure(5, minsize=40)
+        coordframe.rowconfigure(6, minsize=40)
+    
+        objframe.columnconfigure(0, minsize=160)
+        objframe.columnconfigure(1, minsize=160)
+        objframe.columnconfigure(2, minsize=160)
+    
+        objframe.rowconfigure(0, minsize=50)
+        objframe.rowconfigure(1, minsize=50)
+        objframe.rowconfigure(2, minsize=20)
+        objframe.rowconfigure(3, minsize=50)
+        objframe.rowconfigure(4, minsize=50)
+        
+        settingsframe.columnconfigure(0,minsize=100)
+        settingsframe.columnconfigure(1,minsize=100)
+        settingsframe.columnconfigure(2,minsize=100)
+        settingsframe.columnconfigure(3,minsize=100)
+        
+        settingsframe.rowconfigure(0,minsize=50)
+        settingsframe.rowconfigure(1,minsize=50)
+        settingsframe.rowconfigure(2,minsize=50)
+        settingsframe.rowconfigure(3,minsize=50)
+        settingsframe.rowconfigure(4,minsize=50)
+    
+        # Labels for upper section; coordinates and time /fp
+        ralabel = ttk.Label(upperframe, text="RA:", style="Upper.TLabel")
+        declabel = ttk.Label(upperframe, text="Dec:", style="Upper.TLabel")
+        raval = ttk.Label(upperframe, style="Upper.TLabel")
+        decval = ttk.Label(upperframe, style="Upper.TLabel")
+        ralabel.grid(row=0, column=0)
+        declabel.grid(row=1, column=0)
+        raval.grid(row=0, column=1)
+        decval.grid(row=1, column=1)
+    
+        azlabel = ttk.Label(upperframe, text="Az:", style="Upper.TLabel")
+        ellabel = ttk.Label(upperframe, text="El:", style="Upper.TLabel")
+        azval = ttk.Label(upperframe, style="Upper.TLabel")
+        elval = ttk.Label(upperframe, style="Upper.TLabel")
+        azlabel.grid(row=0, column=2)
+        ellabel.grid(row=1, column=2)
+        azval.grid(row=0, column=3)
+        elval.grid(row=1, column=3)
+    
+        timelabel = ttk.Label(upperframe, text="Time (UTC):", style="Upper.TLabel")
+        timelabel.grid(row=0, column=4)
+        clock = ttk.Label(upperframe, style="Upper.TLabel")
+        clock.grid(row=1, column=4)
+    
+        # Buttons for mainframe. Added settings option /ccb
+        coordbutton = tk.Button(mainframe, text="Drive to Coordinates", width=12, height=5, wraplength=80,
+                                background="light sky blue", activebackground="deep sky blue",
+                                command=lambda: raise_frame(coordframe))
+        objbutton = tk.Button(mainframe, text="Drive to Object", width=12, height=5, wraplength=80,
+                              background="light sky blue", activebackground="deep sky blue",
+                              command=lambda: raise_frame(objframe))
+        homebutton = tk.Button(mainframe, text="Home Telescope", width=12,
+                               background="light sky blue", activebackground="deep sky blue", command=gohome)
+        stowbutton = tk.Button(mainframe, text="Stow Telescope", width=12,
+                               background="light sky blue", activebackground="deep sky blue", command=gostow)
+        settingsbutton = tk.Button(mainframe, text = "Settings", width = 8, background = "light sky blue", 
+                                   activebackground="deep sky blue", command=lambda: raise_frame(settingsframe))
+        schedulebutton = tk.Button(mainframe,text = "Observing Schedule <IN UTC>", width = 8, height = 5, wraplength=80,
+                                   background="light sky blue", activebackground="deep sky blue",
+                                   command=lambda:schedule_startup())
+        menuquitbutton = tk.Button(mainframe, text="Quit", width=8, wraplength=70,
+                               background="light sky blue", activebackground="deep sky blue", command=lambda: stowcheck())
+        schedulebutton.grid(row=1,column=2)
+        coordbutton.grid(row=1, column=1)
+        objbutton.grid(row=1, column=3)
+        homebutton.grid(row=3, column=1)
+        stowbutton.grid(row=3, column=3)
+        settingsbutton.grid(row=3, column=2)
+        menuquitbutton.grid(row=4,column=2)
+    
+        # Widgets for coordframe /fp
+        coordsyslabel = ttk.Label(coordframe, text="Coordinate System:", style="WiderLower.TLabel")
+        coordsyslabel.grid(row=0, column=0)
+        coordsyschoice = ttk.Combobox(coordframe, values=["Ecliptic", "Equatorial", "Galactic", "Horizontal"],
+                                      state="readonly", width=15)
+        coordsyschoice.grid(row=0, column=2)
+        coordtracklabel = ttk.Label(coordframe, text="Track?", style="WiderLower.TLabel")
+        coordtracklabel.grid(row=1, column=0)
+        coordtrackchoice = tk.BooleanVar()
+        coordtrackcheck = ttk.Checkbutton(coordframe, style="Lower.TCheckbutton", variable=coordtrackchoice)
+        coordtrackcheck.grid(row=1, column=2)
+        
+        coordchoplabel = ttk.Label(coordframe,text="Chop?",style="WiderLower.TLabel")
+        coordchoplabel.grid(row=2,column=0)
+        mainnavinterface.chopchoice = tk.BooleanVar()
+        coordchopcheck = ttk.Checkbutton(coordframe, style="Lower.TCheckbutton", variable=mainnavinterface.chopchoice)
+        coordchopcheck.grid(row=2, column=2)
+    
+        horizlabel = ttk.Label(coordframe, text="Horizontal", style="Lower.TLabel")
+        horizlabel.grid(row=3, column=0)                    
+        horizdeg = ttk.Entry(coordframe, width=15)
+        horizdeg.grid(row=4, column=0)
+        horizdegsymbol = ttk.Label(coordframe, text="d", style="MiniLower.TLabel")
+        horizdegsymbol.grid(row=4, column=1, sticky="W")
+        horizmin = ttk.Entry(coordframe, width=15)
+        horizmin.grid(row=5, column=0)
+        horizminsymbol = ttk.Label(coordframe, text="m", style="MiniLower.TLabel")
+        horizminsymbol.grid(row=5, column=1, sticky="W")
+        horizsec = tk.StringVar()
+        horizsec = ttk.Entry(coordframe, width=15)
+        horizsec.grid(row=6, column=0)
+        horizsecsymbol = ttk.Label(coordframe, text="s", style="MiniLower.TLabel")
+        horizsecsymbol.grid(row=6, column=1, sticky="W")
+    
+        vertlabel = ttk.Label(coordframe, text="Vertical", style="Lower.TLabel")
+        vertlabel.grid(row=3, column=2)
+        vertdeg = ttk.Entry(coordframe, width=15)
+        vertdeg.grid(row=4, column=2)
+        vertdegsymbol = ttk.Label(coordframe, text="d", style="MiniLower.TLabel")
+        vertdegsymbol.grid(row=4, column=3, sticky="W")
+        vertmin = ttk.Entry(coordframe,width=15)
+        vertmin.grid(row=5, column=2)
+        vertminsymbol = ttk.Label(coordframe, text="m", style="MiniLower.TLabel")
+        vertminsymbol.grid(row=5, column=3, sticky="W")
+        vertsec = ttk.Entry(coordframe, width=15)
+        vertsec.grid(row=6, column=2)
+        vertsecsymbol = ttk.Label(coordframe, text="s", style="MiniLower.TLabel")
+        vertsecsymbol.grid(row=6, column=3, sticky="W")
+    
+        drivebutton = tk.Button(coordframe, text="Drive", width=12, height=1, wraplength=70,
+                                background="light sky blue", activebackground="deep sky blue", 
+                                command=lambda: statusupdate(mainnavinterface.coord_statusupdate,is_coord=True))
+        drivebutton.grid(row=0, column=4)
+        stopbutton = tk.Button(coordframe, text="Stop", width=12, height=1, wraplength=70,
+                               background="light sky blue", activebackground="deep sky blue", command=lambda: Stop_Drive())
+        stopbutton.grid(row=1, column=4)
+        backbutton = tk.Button(coordframe, text="Back", width=12, height=1, wraplength=70,
+                               background="light sky blue", activebackground="deep sky blue",
+                               command=lambda: raise_frame(mainframe))
+        backbutton.grid(row=5, column=4)
+        quitbutton = tk.Button(coordframe, text="Quit", width=12, height=1, wraplength=70,
+                               background="light sky blue", activebackground="deep sky blue", command=lambda: stowcheck())
+        quitbutton.grid(row=6, column=4)
+    
+        # Widgets for objframe /fp
+        objchoicelabel = ttk.Label(objframe, text="Object:", style="WiderLower.TLabel")
+        objchoicelabel.grid(row=0, column=0)
+        objchoice = ttk.Combobox(objframe, values=["Sun", "Moon", "Cassiopeia A", "Sagittarius A", "Cygnus A",
+                                                       "Crab Nebula"], state="readonly", width=13)
+        objchoice.grid(row=0, column=1)
+        objchoice.bind("<<ComboBoxSelected>>", lambda e: risesetbutton.invoke)
+        objtracklabel = ttk.Label(objframe, text="Track?", style="WiderLower.TLabel")
+        objtracklabel.grid(row=1, column=0)
+        objtrackchoice = tk.BooleanVar()
+        objtrackcheck = ttk.Checkbutton(objframe, style="Lower.TCheckbutton", variable=objtrackchoice)
+        objtrackcheck.grid(row=1, column=1)
+        choplabel = ttk.Label(objframe,text="Chop?", style = "WiderLower.TLabel")
+        choplabel.grid(row=2,column=0)
+        chopchoicecheck = ttk.Checkbutton(objframe,style="Lower.TCheckbutton",variable=mainnavinterface.chopchoice)
+        chopchoicecheck.grid(row=2,column=1)
+        
+     #   def blurbutton(event):
+       #     if mainnavinterface.chopchoice.get() == False:
+      #          chopdistent.config(state='normal')
+        #    if mainnavinterface.chopchoice.get() == True:
+         #       chopdistent.config(state='disabled')
+        #chopchoicecheck.bind("<Button-1>", blurbutton)
+    #    chopdistancelabel = ttk.Label(objframe,text="Chop distance (arcmin):",style="WiderLower.TLabel",
+     #                                 wraplength=100,justify=tk.CENTER)
+      #  chopdistancelabel.grid(row=3,column=0)
+    #    chopdistent = ttk.Entry(objframe,width=5,state='disabled')
+     #   chopdistent.grid(row=3,column=1)
+        risesetbutton = tk.Button(objframe, text="Generate rise/set times", width=12, height=5, wraplength=80,
+                                  background="light sky blue", activebackground="deep sky blue",
+                                  command=lambda: [getriseset(),print("Pressed")])
+        risesetbutton.grid(row=3, column=0, rowspan=2)
+        risesettext = tk.StringVar()
+        risesetlabel = ttk.Label(objframe, textvariable=risesettext, style="WiderLower.TLabel")
+        risesetlabel.grid(row=3, column=1, rowspan=2)
+    
+        drivebutton = tk.Button(objframe, text="Drive", width=12, height=1, wraplength=70,
+                                background="light sky blue", activebackground="deep sky blue", 
+                                command= lambda: statusupdate(objchoice,is_obj=True))
+        drivebutton.grid(row=0, column=2)
+        stopbutton = tk.Button(objframe, text="Stop", width=12, height=1, wraplength=70,
+                               background="light sky blue", activebackground="deep sky blue", command=lambda: Stop_Drive())
+        stopbutton.grid(row=1, column=2)
+        backbutton = tk.Button(objframe, text="Back", width=12, height=1, wraplength=70,
+                               background="light sky blue", activebackground="deep sky blue",
+                               command=lambda: raise_frame(mainframe))
+        backbutton.grid(row=3, column=2)
+        quitbutton = tk.Button(objframe, text="Quit", width=12, height=1, wraplength=70,
+                               background="light sky blue", activebackground="deep sky blue", command=lambda: stowcheck())
+        quitbutton.grid(row=4, column=2)
+        
+        # Widgets for settingsframe /ccb
+        azlabel = ttk.Label(settingsframe,text="Azimuth",style="WiderLower.TLabel")
+        azlabel.grid(row=0,column=1)
+        ellabel = ttk.Label(settingsframe,text="Elevation",style="WiderLower.TLabel")
+        ellabel.grid(row=0,column=2)
+        homecoordlabel = ttk.Label(settingsframe, text="Home Coordinates:", style = "WiderLower.TLabel")
+        homecoordlabel.grid(row=1,column=0)
+        stowcoordlabel = ttk.Label(settingsframe, text="Stow Coordinates:", style = "WiderLower.TLabel")
+        stowcoordlabel.grid(row=2,column=0)
+        homeaz = tk.StringVar(settingsframe,value = defaulthomeaz)
+        homeel = tk.StringVar(settingsframe,value=defaulthomeel)
+        homeazentry = ttk.Entry(settingsframe,textvariable=homeaz,width=6)
+        homeazentry.grid(row=1,column=1)
+        homeelentry = ttk.Entry(settingsframe,textvariable=homeel,width=6)
+        homeelentry.grid(row=1,column=2)
+        stowaz = tk.StringVar(settingsframe,value=defaultstowaz)
+        stowel = tk.StringVar(settingsframe,value=defaultstowel)
+        stowazentry = ttk.Entry(settingsframe,textvariable=stowaz,width=6)
+        stowazentry.grid(row=2,column=1)
+        stowelentry = ttk.Entry(settingsframe,textvariable=stowel,width=6)
+        stowelentry.grid(row=2,column=2)
+        chopbutton = tk.Button(settingsframe,text="Chop Setup",width=12, height=1, wraplength = 70,
+                               background="light sky blue", activebackground="deep sky blue",
+                               command=lambda: chopsetup())
+        chopbutton.grid(row=3,column=1)
+        backbutton = tk.Button(settingsframe, text="Back", width=12, height=1, wraplength=70,
+                               background="light sky blue", activebackground="deep sky blue",
+                               command=lambda: raise_frame(mainframe))
+        backbutton.grid(row=4, column=0)
+        savebutton = tk.Button(settingsframe,text="Save", width=12, height=1, wraplength=70,
+                               background="light sky blue", activebackground="deep sky blue",
+                               command=lambda: savecoords())
+        savebutton.grid(row=4,column=3)
+        raise_frame(mainframe)
+        
+        #Fire off some functions immediately to get things moving eg. the clock.
+        refreshsch()
+        getlocation()
+        tick()
+        ReadFunction()
+        
+        def timetoschstart():
+            #Find when the next hour starts for schedule purposes. /ccb
+            currenthour=int(time.strftime("%H",time.gmtime()))
+            timenow = datetime.datetime.now()
+            nextoclock = datetime.datetime.now().replace(hour=currenthour+1,minute=0,second=0,microsecond=0)           
+            timetonext_oclock = (nextoclock-timenow).total_seconds()
+            mainnavinterface.timetoschstart = int(timetonext_oclock)
+        timetoschstart()
+        
+        #Follow the schedule at the beginning of the hour: makes timing a lot easier.
+        mainnavinterface.after((mainnavinterface.timetoschstart+5)*1000,followsch)
+        
+        #Closing protocol - check if the telescope should be stowed on interface quit.
+        mainnavinterface.protocol("WM_DELETE_WINDOW", lambda: stowcheck())
+        mainnavinterface.mainloop()
+            
+    menuscreen.mainloop()
+
+#Finally, run the interface. /ccb
+runinterface()
